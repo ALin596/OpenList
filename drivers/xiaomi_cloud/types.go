@@ -74,14 +74,14 @@ type FileInfoResp struct {
 		ModifyTime int64       `json:"modifyTime"`
 		Storage    struct {
 			Kss struct {
-				Bucket string `json:"bucket"`
-				Key    string `json:"key"`
 				Blocks []struct {
-					URL   string `json:"url"`
-					Size  int64  `json:"size"`
-					Sha1  string `json:"sha1"`
-					Index int    `json:"index"`
+					IDCName string   `json:"idc_name"`
+					Sha1    string   `json:"sha1"`
+					Size    int64    `json:"size"`
+					URLs    []string `json:"urls"`
 				} `json:"blocks"`
+				SecureKey string `json:"secure_key"`
+				Stat      string `json:"stat"`
 			} `json:"kss"`
 			DownloadURL string `json:"downloadUrl"`
 			ExpireAt    int64  `json:"expireAt"`
@@ -92,8 +92,10 @@ type FileInfoResp struct {
 // StorageInfoResp 存储空间响应
 type StorageInfoResp struct {
 	Result      string `json:"result"`
+	Retriable   bool   `json:"retriable"`
 	Code        int    `json:"code"`
 	Description string `json:"description"`
+	TS          int64  `json:"ts"`
 	Data        struct {
 		TotalQuota  int64 `json:"totalQuota"`
 		Used        int64 `json:"used"`
@@ -115,18 +117,40 @@ type StorageInfoResp struct {
 // CreateUploadResp 创建上传任务响应
 type CreateUploadResp struct {
 	Result      string `json:"result"`
+	Retriable   bool   `json:"retriable"`
 	Code        int    `json:"code"`
 	Description string `json:"description"`
+	TS          int64  `json:"ts"`
 	Data        struct {
-		UploadID string   `json:"uploadId"`
-		Exists   bool     `json:"exists"` // true表示秒传成功
-		ID       string   `json:"id"`     // 文件ID
-		FileMeta string   `json:"file_meta,omitempty"`
-		NodeURLs []string `json:"node_urls,omitempty"`
+		UploadID string `json:"uploadId"`
+		Exists   bool   `json:"exists"` // true表示秒传成功
+		ID       string `json:"id"`     // 文件ID
 		Kss      struct {
-			BlockMetas []string `json:"block_metas,omitempty"`
+			BlockMetas      []UploadBlockMeta `json:"block_metas,omitempty"`
+			ContentCacheKey string            `json:"contentCacheKey,omitempty"`
+			FileMeta        string            `json:"file_meta,omitempty"`
+			NodeURLs        []string          `json:"node_urls,omitempty"`
+			Stat            string            `json:"stat,omitempty"`
 		} `json:"kss,omitempty"`
 	} `json:"data"`
+}
+
+// UploadBlockMeta 小米云盘为每个文件块返回的上传元数据。
+// is_existed 在实际响应中是数字（0/1），不是布尔值。
+type UploadBlockMeta struct {
+	BlockMeta string `json:"block_meta"`
+	IsExisted int    `json:"is_existed"`
+}
+
+// UploadBlockResp 单个KSS文件块上传响应
+type UploadBlockResp struct {
+	CommitMeta string `json:"commit_meta"`
+	Stat       string `json:"stat"`
+}
+
+// CommitMeta 提交上传时的单块确认信息
+type CommitMeta struct {
+	CommitMeta string `json:"commit_meta"`
 }
 
 // BlockInfo 文件块信息(用于上传)
@@ -158,16 +182,20 @@ type UploadFileData struct {
 // CreateFolderResp 创建文件夹响应
 type CreateFolderResp struct {
 	Result      string `json:"result"`
+	Retriable   bool   `json:"retriable"`
 	Code        int    `json:"code"`
 	Description string `json:"description"`
+	TS          int64  `json:"ts"`
 	Data        File   `json:"data"`
 }
 
 // DeleteResp 删除操作响应(异步任务)
 type DeleteResp struct {
 	Result      string `json:"result"`
+	Retriable   bool   `json:"retriable"`
 	Code        int    `json:"code"`
 	Description string `json:"description"`
+	TS          int64  `json:"ts"`
 	Data        struct {
 		TaskID     string `json:"taskId"`
 		ExpireTime int64  `json:"expireTime"`
@@ -175,31 +203,45 @@ type DeleteResp struct {
 	} `json:"data"`
 }
 
+// FileManagerRecord 移动、删除等批量文件管理操作的单条记录
+type FileManagerRecord struct {
+	ID       string `json:"id"`
+	ParentID string `json:"parentId,omitempty"`
+	Type     string `json:"type"`
+}
+
 // TaskQueryResp 任务查询响应
 type TaskQueryResp struct {
 	Result      string `json:"result"`
+	Retriable   bool   `json:"retriable"`
 	Code        int    `json:"code"`
 	Description string `json:"description"`
+	TS          int64  `json:"ts"`
 	Data        struct {
-		TaskID      string `json:"taskId"`
-		OperateType string `json:"operateType"`
-		Status      string `json:"status"` // SUCCESS, PROCESSING, FAILED
+		TaskID      string  `json:"taskId"`
+		OperateType string  `json:"operateType"`
+		Status      string  `json:"status"` // SUCCESS, PROCESSING, FAILED
+		Progress    float64 `json:"progress,omitempty"`
 	} `json:"data"`
 }
 
 // RenameResp 重命名响应
 type RenameResp struct {
 	Result      string `json:"result"`
+	Retriable   bool   `json:"retriable"`
 	Reason      string `json:"reason"`
 	Code        int    `json:"code"`
 	Description string `json:"description"`
+	TS          int64  `json:"ts"`
 }
 
 // SearchResp 搜索响应
 type SearchResp struct {
 	Result      string `json:"result"`
+	Retriable   bool   `json:"retriable"`
 	Code        int    `json:"code"`
 	Description string `json:"description"`
+	TS          int64  `json:"ts"`
 	Data        struct {
 		Records  []File `json:"records"`
 		HasMore  bool   `json:"hasMore"`

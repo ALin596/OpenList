@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
@@ -150,18 +152,28 @@ func (d *XiaomiCloud) MakeDir(ctx context.Context, parentDir model.Obj, dirName 
 }
 
 func (d *XiaomiCloud) Move(ctx context.Context, srcObj, dstDir model.Obj) error {
-	// 小米云盘的移动接口需要进一步测试确认
-	// 根据API分析,推测接口为 POST /drive/v2/user/records/move
-	apiURL := fmt.Sprintf("%s%s/records/move", BaseURL, APIPrefix)
+	apiURL := fmt.Sprintf("%s%s/records/filemanager", BaseURL, APIPrefix)
+
+	operateRecords := []FileManagerRecord{
+		{
+			ID:       srcObj.GetID(),
+			ParentID: dstDir.GetID(),
+			Type:     getFileManagerRecordType(srcObj),
+		},
+	}
+	operateRecordsJSON, err := json.Marshal(operateRecords)
+	if err != nil {
+		return fmt.Errorf("构建移动请求失败: %w", err)
+	}
 
 	formData := buildFormData(map[string]interface{}{
-		"id":           srcObj.GetID(),
-		"toParentId":   dstDir.GetID(),
-		"serviceToken": d.ServiceToken,
+		"operateType":    "MOVE",
+		"operateRecords": string(operateRecordsJSON),
+		"serviceToken":   d.ServiceToken,
 	})
 
-	var resp RenameResp
-	_, err := d.request(apiURL, http.MethodPost, func(req *resty.Request) {
+	var resp DeleteResp
+	_, err = d.request(apiURL, http.MethodPost, func(req *resty.Request) {
 		req.SetHeader("Content-Type", "application/x-www-form-urlencoded")
 		req.SetBody(formData)
 	}, &resp)
@@ -172,6 +184,12 @@ func (d *XiaomiCloud) Move(ctx context.Context, srcObj, dstDir model.Obj) error 
 
 	if resp.Code != 0 {
 		return fmt.Errorf("移动文件失败: %s", resp.Description)
+	}
+
+	if resp.Data.TaskID != "" {
+		if err = d.waitForTask(resp.Data.TaskID, 30*time.Second); err != nil {
+			return fmt.Errorf("移动任务失败: %w", err)
+		}
 	}
 
 	return nil
@@ -213,17 +231,17 @@ func (d *XiaomiCloud) Remove(ctx context.Context, obj model.Obj) error {
 	apiURL := fmt.Sprintf("%s%s/records/filemanager", BaseURL, APIPrefix)
 
 	// 构建操作记录
-	operateRecords := []map[string]string{
+	operateRecords := []FileManagerRecord{
 		{
-			"id":   obj.GetID(),
-			"type": "other",
+			ID:   obj.GetID(),
+			Type: getFileManagerRecordType(obj),
 		},
 	}
-	if obj.IsDir() {
-		operateRecords[0]["type"] = "folder"
-	}
 
-	operateRecordsJSON, _ := json.Marshal(operateRecords)
+	operateRecordsJSON, err := json.Marshal(operateRecords)
+	if err != nil {
+		return fmt.Errorf("构建删除请求失败: %w", err)
+	}
 
 	formData := buildFormData(map[string]interface{}{
 		"operateType":    "DELETE",
@@ -232,7 +250,7 @@ func (d *XiaomiCloud) Remove(ctx context.Context, obj model.Obj) error {
 	})
 
 	var resp DeleteResp
-	_, err := d.request(apiURL, http.MethodPost, func(req *resty.Request) {
+	_, err = d.request(apiURL, http.MethodPost, func(req *resty.Request) {
 		req.SetHeader("Content-Type", "application/x-www-form-urlencoded")
 		req.SetBody(formData)
 	}, &resp)
@@ -328,10 +346,14 @@ func (d *XiaomiCloud) Put(ctx context.Context, dstDir model.Obj, fileStreamer mo
 	})
 
 	var createResp CreateUploadResp
-	_, err = d.request(apiURL, http.MethodPost, func(req *resty.Request) {
-		req.SetHeader("Content-Type", "application/x-www-form-urlencoded")
-		req.SetBody(formData)
-	}, &createResp)
+	err = d.retryRequest(3, func() error {
+		createResp = CreateUploadResp{}
+		_, requestErr := d.request(apiURL, http.MethodPost, func(req *resty.Request) {
+			req.SetHeader("Content-Type", "application/x-www-form-urlencoded")
+			req.SetBody(formData)
+		}, &createResp)
+		return requestErr
+	})
 
 	if err != nil {
 		return normalizeError(err)
@@ -342,7 +364,7 @@ func (d *XiaomiCloud) Put(ctx context.Context, dstDir model.Obj, fileStreamer mo
 	}
 
 	// 检查是否秒传成功
-	if d.RapidUpload && createResp.Data.Exists {
+	if createResp.Data.Exists {
 		log.Infof("[xiaomi_cloud] 文件秒传成功: %s (ID: %s)", fileName, createResp.Data.ID)
 		up(100)
 		return nil
@@ -353,16 +375,22 @@ func (d *XiaomiCloud) Put(ctx context.Context, dstDir model.Obj, fileStreamer mo
 
 	// 提取上传所需的参数
 	uploadID := createResp.Data.UploadID
-	fileMeta := createResp.Data.FileMeta
-	nodeURL := createResp.Data.NodeURLs[0]
+	fileMeta := createResp.Data.Kss.FileMeta
+	if len(createResp.Data.Kss.NodeURLs) == 0 {
+		return fmt.Errorf("创建上传任务未返回KSS节点地址")
+	}
+	nodeURL := createResp.Data.Kss.NodeURLs[0]
 	blockMetas := createResp.Data.Kss.BlockMetas
+	if uploadID == "" || fileMeta == "" {
+		return fmt.Errorf("创建上传任务返回的KSS元数据不完整")
+	}
 
 	if len(blockMetas) != blockCount {
 		return fmt.Errorf("分块数量不匹配: 预期 %d, 实际 %d", blockCount, len(blockMetas))
 	}
 
 	// 记录所有块的commit_meta
-	commitMetas := make([]map[string]string, 0, blockCount)
+	commitMetas := make([]CommitMeta, 0, blockCount)
 
 	// 上传每个分块
 	for i := 0; i < blockCount; i++ {
@@ -373,39 +401,43 @@ func (d *XiaomiCloud) Put(ctx context.Context, dstDir model.Obj, fileStreamer mo
 		}
 
 		blockData := tempData[start:end]
-		blockMeta := blockMetas[i]
+		blockMeta := blockMetas[i].BlockMeta
+		if blockMeta == "" {
+			return fmt.Errorf("分块 %d 未返回block_meta", i+1)
+		}
 
 		log.Infof("[xiaomi_cloud] 上传分块 %d/%d (大小: %d 字节)", i+1, blockCount, len(blockData))
 
 		// 构建上传URL
-		uploadURL := fmt.Sprintf("%s/upload_block_chunk?chunk_pos=%d&file_meta=%s&block_meta=%s",
-			nodeURL, i, fileMeta, blockMeta)
+		uploadURL := buildKSSUploadURL(nodeURL, fileMeta, blockMeta)
 
 		// 上传分块
-		var blockResp map[string]interface{}
-		_, err = d.request(uploadURL, http.MethodPost, func(req *resty.Request) {
-			req.SetHeader("Content-Type", "application/octet-stream")
-			req.SetBody(blockData)
-		}, &blockResp)
+		var blockResp UploadBlockResp
+		err = d.retryRequest(3, func() error {
+			blockResp = UploadBlockResp{}
+			_, requestErr := d.request(uploadURL, http.MethodPost, func(req *resty.Request) {
+				req.SetHeader("Content-Type", "application/octet-stream")
+				req.SetBody(blockData)
+			}, &blockResp)
+			return requestErr
+		})
 
 		if err != nil {
 			return fmt.Errorf("上传分块 %d 失败: %w", i+1, err)
 		}
 
 		// 检查分块上传状态
-		stat, ok := blockResp["stat"].(string)
-		if !ok || stat != "BLOCK_COMPLETED" {
-			return fmt.Errorf("分块 %d 上传状态异常: %v", i+1, blockResp)
+		if blockResp.Stat != "BLOCK_COMPLETED" {
+			return fmt.Errorf("分块 %d 上传状态异常: %s", i+1, blockResp.Stat)
 		}
 
 		// 记录commit_meta
-		commitMeta, ok := blockResp["commit_meta"].(string)
-		if !ok {
+		if blockResp.CommitMeta == "" {
 			return fmt.Errorf("分块 %d 未返回commit_meta", i+1)
 		}
 
-		commitMetas = append(commitMetas, map[string]string{
-			"commit_meta": commitMeta,
+		commitMetas = append(commitMetas, CommitMeta{
+			CommitMeta: blockResp.CommitMeta,
 		})
 
 		// 更新进度
@@ -430,10 +462,14 @@ func (d *XiaomiCloud) Put(ctx context.Context, dstDir model.Obj, fileStreamer mo
 	})
 
 	var commitResp CreateUploadResp
-	_, err = d.request(commitURL, http.MethodPost, func(req *resty.Request) {
-		req.SetHeader("Content-Type", "application/x-www-form-urlencoded")
-		req.SetBody(formData)
-	}, &commitResp)
+	err = d.retryRequest(3, func() error {
+		commitResp = CreateUploadResp{}
+		_, requestErr := d.request(commitURL, http.MethodPost, func(req *resty.Request) {
+			req.SetHeader("Content-Type", "application/x-www-form-urlencoded")
+			req.SetBody(formData)
+		}, &commitResp)
+		return requestErr
+	})
 
 	if err != nil {
 		return fmt.Errorf("提交上传失败: %w", err)
@@ -470,3 +506,23 @@ func (d *XiaomiCloud) GetDetails(ctx context.Context) (*model.StorageDetails, er
 }
 
 var _ driver.Driver = (*XiaomiCloud)(nil)
+
+func getFileManagerRecordType(obj model.Obj) string {
+	if obj.IsDir() {
+		return "folder"
+	}
+	if strings.HasPrefix(utils.GetMimeType(obj.GetName()), "image/") {
+		return "pic"
+	}
+	return "other"
+}
+
+func buildKSSUploadURL(nodeURL, fileMeta, blockMeta string) string {
+	query := url.Values{}
+	// block_meta 已经标识文件块；chunk_pos 是该块内部的分片偏移。
+	// 当前每个4 MiB文件块都通过一次请求完整上传，因此固定为0。
+	query.Set("chunk_pos", "0")
+	query.Set("file_meta", fileMeta)
+	query.Set("block_meta", blockMeta)
+	return fmt.Sprintf("%s/upload_block_chunk?%s", strings.TrimRight(nodeURL, "/"), query.Encode())
+}

@@ -3,6 +3,7 @@ package xiaomi_cloud
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/go-resty/resty/v2"
@@ -68,6 +69,7 @@ func TestUpdateCookieFromResponse(t *testing.T) {
 
 			driver := &XiaomiCloud{
 				Addition: Addition{
+					CookieString: `userId=` + tt.initialUserID + `; i.mi.com_ph=` + tt.initialUHash + `; keep=unchanged; serviceToken=` + tt.initialToken + `; i.mi.com_slh=` + tt.initialSHash,
 					ServiceToken: tt.initialToken,
 					UserID:       tt.initialUserID,
 					SessionHash:  tt.initialSHash,
@@ -94,6 +96,17 @@ func TestUpdateCookieFromResponse(t *testing.T) {
 			}
 			if driver.UserHash != tt.expectUHash {
 				t.Errorf("UserHash = %v, want %v", driver.UserHash, tt.expectUHash)
+			}
+
+			serviceToken, userID, sessionHash, userHash, err := ParseCookieString(driver.CookieString)
+			if err != nil {
+				t.Fatalf("ParseCookieString(updated CookieString) error = %v", err)
+			}
+			if serviceToken != tt.expectToken || userID != tt.expectUserID || sessionHash != tt.expectSHash || userHash != tt.expectUHash {
+				t.Fatalf("CookieString was not synchronized with refreshed fields")
+			}
+			if !strings.Contains(driver.CookieString, "keep=unchanged") {
+				t.Fatal("CookieString did not preserve unrelated cookie values")
 			}
 		})
 	}

@@ -15,6 +15,7 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/go-resty/resty/v2"
 	log "github.com/sirupsen/logrus"
 )
@@ -63,11 +64,6 @@ func (d *XiaomiCloud) request(url string, method string, callback base.ReqCallba
 		callback(req)
 	}
 
-	// 如果需要解析响应
-	if resp != nil {
-		req.SetResult(resp)
-	}
-
 	// 发送请求
 	var res *resty.Response
 	var err error
@@ -98,8 +94,14 @@ func (d *XiaomiCloud) request(url string, method string, callback base.ReqCallba
 
 	body := res.Body()
 
-	// 检查API响应码
+	// 小米KSS上传接口返回JSON响应体，但不设置Content-Type。
+	// 不依赖Resty的Content-Type检测，统一显式解析响应。
 	if resp != nil {
+		if err := json.Unmarshal(body, resp); err != nil {
+			return body, fmt.Errorf("解析响应失败: %w", err)
+		}
+
+		// 检查API响应码
 		// 尝试解析错误响应
 		var errResp ErrorResp
 		if err := json.Unmarshal(body, &errResp); err == nil {
@@ -126,17 +128,7 @@ func (d *XiaomiCloud) updateCookieFromResponse(res *resty.Response) {
 		switch cookie.Name {
 		case "serviceToken":
 			if cookie.Value != "" && cookie.Value != d.ServiceToken {
-				oldMaxLen := 20
-				if len(d.ServiceToken) < oldMaxLen {
-					oldMaxLen = len(d.ServiceToken)
-				}
-				newMaxLen := 20
-				if len(cookie.Value) < newMaxLen {
-					newMaxLen = len(cookie.Value)
-				}
-				oldToken := d.ServiceToken[:oldMaxLen] + "..."
-				newToken := cookie.Value[:newMaxLen] + "..."
-				log.Debugf("[xiaomi_cloud] 服务令牌已更新: %s -> %s", oldToken, newToken)
+				log.Debug("[xiaomi_cloud] 服务令牌已更新")
 				d.ServiceToken = cookie.Value
 				updated = true
 			}
@@ -164,8 +156,51 @@ func (d *XiaomiCloud) updateCookieFromResponse(res *resty.Response) {
 	}
 
 	if updated {
+		d.CookieString = mergeCookieString(d.CookieString, map[string]string{
+			"serviceToken": d.ServiceToken,
+			"userId":       d.UserID,
+			"i.mi.com_slh": d.SessionHash,
+			"i.mi.com_ph":  d.UserHash,
+		})
+		if d.ID != 0 {
+			op.MustSaveDriverStorage(d)
+		}
 		log.Infof("[xiaomi_cloud] Cookie已自动刷新")
 	}
+}
+
+func mergeCookieString(cookieString string, replacements map[string]string) string {
+	pairs := strings.Split(cookieString, ";")
+	result := make([]string, 0, len(pairs)+len(replacements))
+	seen := make(map[string]bool, len(replacements))
+
+	for _, pair := range pairs {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		parts := strings.SplitN(pair, "=", 2)
+		if len(parts) != 2 {
+			result = append(result, pair)
+			continue
+		}
+
+		key := strings.TrimSpace(parts[0])
+		if value, ok := replacements[key]; ok {
+			result = append(result, key+"="+value)
+			seen[key] = true
+			continue
+		}
+		result = append(result, pair)
+	}
+
+	for _, key := range []string{"userId", "i.mi.com_ph", "serviceToken", "i.mi.com_slh"} {
+		if value, ok := replacements[key]; ok && value != "" && !seen[key] {
+			result = append(result, key+"="+value)
+		}
+	}
+
+	return strings.Join(result, "; ")
 }
 
 // getFiles 获取指定目录下的文件列表
@@ -266,21 +301,33 @@ func (d *XiaomiCloud) waitForTask(taskID string, maxWaitTime time.Duration) erro
 			return fmt.Errorf("查询任务失败: %s", resp.Description)
 		}
 
-		switch resp.Data.Status {
-		case "SUCCESS":
-			return nil
-		case "FAILED":
-			return fmt.Errorf("任务失败: taskId=%s", taskID)
-		case "PROCESSING":
-			// 继续等待
-			time.Sleep(interval)
-			// 逐渐增加轮询间隔,最大1秒
-			if interval < time.Second {
-				interval += 100 * time.Millisecond
-			}
-		default:
-			return fmt.Errorf("未知任务状态: %s", resp.Data.Status)
+		done, statusErr := evaluateTaskStatus(resp.Data.Status, taskID)
+		if statusErr != nil {
+			return statusErr
 		}
+		if done {
+			return nil
+		}
+
+		// 继续等待
+		time.Sleep(interval)
+		// 逐渐增加轮询间隔,最大1秒
+		if interval < time.Second {
+			interval += 100 * time.Millisecond
+		}
+	}
+}
+
+func evaluateTaskStatus(status, taskID string) (bool, error) {
+	switch status {
+	case "SUCCESS":
+		return true, nil
+	case "RUNNING", "PROCESSING":
+		return false, nil
+	case "FAILED":
+		return false, fmt.Errorf("任务失败: taskId=%s", taskID)
+	default:
+		return false, fmt.Errorf("未知任务状态: %s", status)
 	}
 }
 
@@ -309,11 +356,16 @@ func isRetriableError(err error) bool {
 	if err == nil {
 		return false
 	}
-	errMsg := err.Error()
+	errMsg := strings.ToLower(err.Error())
 	// 网络错误、超时错误等可重试
 	return strings.Contains(errMsg, "timeout") ||
+		strings.Contains(errMsg, "http错误: 502") ||
+		strings.Contains(errMsg, "http错误: 503") ||
+		strings.Contains(errMsg, "http错误: 504") ||
 		strings.Contains(errMsg, "connection") ||
-		strings.Contains(errMsg, "temporary")
+		strings.Contains(errMsg, "temporary") ||
+		strings.Contains(errMsg, "connection reset") ||
+		strings.Contains(errMsg, "unexpected eof")
 }
 
 // retryRequest 带重试的请求

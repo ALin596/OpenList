@@ -34,3 +34,7 @@ output/
 
 .VSCodeCounter
 *.syso
+
+# Local AI assistant and editor history
+/.claude/
+/.history/

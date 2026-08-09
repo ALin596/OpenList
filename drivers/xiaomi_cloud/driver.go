@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
@@ -22,6 +23,13 @@ import (
 type XiaomiCloud struct {
 	model.Storage
 	Addition
+
+	sessionMu    sync.RWMutex
+	refreshMu    sync.Mutex
+	serviceToken string
+	userID       string
+	sessionHash  string
+	userHash     string
 }
 
 func (d *XiaomiCloud) Config() driver.Config {
@@ -33,25 +41,14 @@ func (d *XiaomiCloud) GetAddition() driver.Additional {
 }
 
 func (d *XiaomiCloud) Init(ctx context.Context) error {
-	// 如果提供了完整的Cookie字符串，自动解析
-	if d.CookieString != "" {
-		serviceToken, userId, sessionHash, userHash, err := ParseCookieString(d.CookieString)
-		if err != nil {
-			return fmt.Errorf("解析Cookie字符串失败: %w", err)
-		}
-
-		// 自动填充各个字段
-		d.ServiceToken = serviceToken
-		d.UserID = userId
-		d.SessionHash = sessionHash
-		d.UserHash = userHash
-
-		log.Infof("[xiaomi_cloud] 已从Cookie字符串中提取认证信息")
+	if strings.TrimSpace(d.AccountCookie) == "" {
+		return fmt.Errorf("account_cookie 不能为空")
 	}
-
-	// 验证必需字段
-	if d.ServiceToken == "" || d.UserID == "" || d.SessionHash == "" || d.UserHash == "" {
-		return fmt.Errorf("Cookie配置不完整，请提供 cookie_string 或手动填写所有认证字段")
+	if !hasCookie(d.AccountCookie, "passToken") {
+		return fmt.Errorf("account_cookie 中缺少 passToken")
+	}
+	if err := d.ensureServiceToken(""); err != nil {
+		return normalizeError(err)
 	}
 
 	// 验证Cookie有效性
@@ -70,7 +67,7 @@ func (d *XiaomiCloud) Init(ctx context.Context) error {
 	}
 
 	if statusResp.Code != 0 {
-		return errs.NewErr(errs.EmptyToken, "Cookie验证失败,请检查配置")
+		return errs.NewErr(errs.EmptyToken, "serviceToken 验证失败，请检查 account_cookie")
 	}
 
 	if statusResp.Data.Status != "NORMAL" {
@@ -127,16 +124,14 @@ func (d *XiaomiCloud) Link(ctx context.Context, file model.Obj, args model.LinkA
 func (d *XiaomiCloud) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {
 	apiURL := fmt.Sprintf("%s%s/folders/create", BaseURL, APIPrefix)
 
-	formData := buildFormData(map[string]interface{}{
-		"name":         dirName,
-		"parentId":     parentDir.GetID(),
-		"serviceToken": d.ServiceToken,
-	})
-
 	var resp CreateFolderResp
-	_, err := d.request(apiURL, http.MethodPost, func(req *resty.Request) {
+	_, err := d.request(apiURL, http.MethodPost, func(req *resty.Request, serviceToken string) {
 		req.SetHeader("Content-Type", "application/x-www-form-urlencoded")
-		req.SetBody(formData)
+		req.SetBody(buildFormData(map[string]interface{}{
+			"name":         dirName,
+			"parentId":     parentDir.GetID(),
+			"serviceToken": serviceToken,
+		}))
 	}, &resp)
 
 	if err != nil {
@@ -166,16 +161,14 @@ func (d *XiaomiCloud) Move(ctx context.Context, srcObj, dstDir model.Obj) error 
 		return fmt.Errorf("构建移动请求失败: %w", err)
 	}
 
-	formData := buildFormData(map[string]interface{}{
-		"operateType":    "MOVE",
-		"operateRecords": string(operateRecordsJSON),
-		"serviceToken":   d.ServiceToken,
-	})
-
 	var resp DeleteResp
-	_, err = d.request(apiURL, http.MethodPost, func(req *resty.Request) {
+	_, err = d.request(apiURL, http.MethodPost, func(req *resty.Request, serviceToken string) {
 		req.SetHeader("Content-Type", "application/x-www-form-urlencoded")
-		req.SetBody(formData)
+		req.SetBody(buildFormData(map[string]interface{}{
+			"operateType":    "MOVE",
+			"operateRecords": string(operateRecordsJSON),
+			"serviceToken":   serviceToken,
+		}))
 	}, &resp)
 
 	if err != nil {
@@ -198,17 +191,15 @@ func (d *XiaomiCloud) Move(ctx context.Context, srcObj, dstDir model.Obj) error 
 func (d *XiaomiCloud) Rename(ctx context.Context, srcObj model.Obj, newName string) error {
 	apiURL := fmt.Sprintf("%s%s/records/rename", BaseURL, APIPrefix)
 
-	formData := buildFormData(map[string]interface{}{
-		"id":           srcObj.GetID(),
-		"newName":      newName,
-		"channel":      "WEB",
-		"serviceToken": d.ServiceToken,
-	})
-
 	var resp RenameResp
-	_, err := d.request(apiURL, http.MethodPost, func(req *resty.Request) {
+	_, err := d.request(apiURL, http.MethodPost, func(req *resty.Request, serviceToken string) {
 		req.SetHeader("Content-Type", "application/x-www-form-urlencoded")
-		req.SetBody(formData)
+		req.SetBody(buildFormData(map[string]interface{}{
+			"id":           srcObj.GetID(),
+			"newName":      newName,
+			"channel":      "WEB",
+			"serviceToken": serviceToken,
+		}))
 	}, &resp)
 
 	if err != nil {
@@ -243,16 +234,14 @@ func (d *XiaomiCloud) Remove(ctx context.Context, obj model.Obj) error {
 		return fmt.Errorf("构建删除请求失败: %w", err)
 	}
 
-	formData := buildFormData(map[string]interface{}{
-		"operateType":    "DELETE",
-		"operateRecords": string(operateRecordsJSON),
-		"serviceToken":   d.ServiceToken,
-	})
-
 	var resp DeleteResp
-	_, err = d.request(apiURL, http.MethodPost, func(req *resty.Request) {
+	_, err = d.request(apiURL, http.MethodPost, func(req *resty.Request, serviceToken string) {
 		req.SetHeader("Content-Type", "application/x-www-form-urlencoded")
-		req.SetBody(formData)
+		req.SetBody(buildFormData(map[string]interface{}{
+			"operateType":    "DELETE",
+			"operateRecords": string(operateRecordsJSON),
+			"serviceToken":   serviceToken,
+		}))
 	}, &resp)
 
 	if err != nil {
@@ -337,20 +326,18 @@ func (d *XiaomiCloud) Put(ctx context.Context, dstDir model.Obj, fileStreamer mo
 
 	// 创建上传任务
 	apiURL := fmt.Sprintf("%s%s/files/create", BaseURL, APIPrefix)
-	formData := buildFormData(map[string]interface{}{
-		"data":                    string(uploadDataJSON),
-		"kss":                     string(kssInfoJSON),
-		"temp":                    false,
-		"isClientUploadThumbnail": false,
-		"serviceToken":            d.ServiceToken,
-	})
-
 	var createResp CreateUploadResp
 	err = d.retryRequest(3, func() error {
 		createResp = CreateUploadResp{}
-		_, requestErr := d.request(apiURL, http.MethodPost, func(req *resty.Request) {
+		_, requestErr := d.request(apiURL, http.MethodPost, func(req *resty.Request, serviceToken string) {
 			req.SetHeader("Content-Type", "application/x-www-form-urlencoded")
-			req.SetBody(formData)
+			req.SetBody(buildFormData(map[string]interface{}{
+				"data":                    string(uploadDataJSON),
+				"kss":                     string(kssInfoJSON),
+				"temp":                    false,
+				"isClientUploadThumbnail": false,
+				"serviceToken":            serviceToken,
+			}))
 		}, &createResp)
 		return requestErr
 	})
@@ -415,7 +402,7 @@ func (d *XiaomiCloud) Put(ctx context.Context, dstDir model.Obj, fileStreamer mo
 		var blockResp UploadBlockResp
 		err = d.retryRequest(3, func() error {
 			blockResp = UploadBlockResp{}
-			_, requestErr := d.request(uploadURL, http.MethodPost, func(req *resty.Request) {
+			_, requestErr := d.request(uploadURL, http.MethodPost, func(req *resty.Request, _ string) {
 				req.SetHeader("Content-Type", "application/octet-stream")
 				req.SetBody(blockData)
 			}, &blockResp)
@@ -451,22 +438,20 @@ func (d *XiaomiCloud) Put(ctx context.Context, dstDir model.Obj, fileStreamer mo
 	commitURL := fmt.Sprintf("%s%s/files/commit", BaseURL, APIPrefix)
 	commitMetasJSON, _ := json.Marshal(commitMetas)
 
-	formData = buildFormData(map[string]interface{}{
-		"uploadId":                uploadID,
-		"file_meta":               fileMeta,
-		"commit_metas":            string(commitMetasJSON),
-		"parentId":                dstDir.GetID(),
-		"temp":                    false,
-		"isClientUploadThumbnail": false,
-		"serviceToken":            d.ServiceToken,
-	})
-
 	var commitResp CreateUploadResp
 	err = d.retryRequest(3, func() error {
 		commitResp = CreateUploadResp{}
-		_, requestErr := d.request(commitURL, http.MethodPost, func(req *resty.Request) {
+		_, requestErr := d.request(commitURL, http.MethodPost, func(req *resty.Request, serviceToken string) {
 			req.SetHeader("Content-Type", "application/x-www-form-urlencoded")
-			req.SetBody(formData)
+			req.SetBody(buildFormData(map[string]interface{}{
+				"uploadId":                uploadID,
+				"file_meta":               fileMeta,
+				"commit_metas":            string(commitMetasJSON),
+				"parentId":                dstDir.GetID(),
+				"temp":                    false,
+				"isClientUploadThumbnail": false,
+				"serviceToken":            serviceToken,
+			}))
 		}, &commitResp)
 		return requestErr
 	})

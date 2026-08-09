@@ -1,110 +1,59 @@
 package xiaomi_cloud
 
 import (
+	"net/http"
+	"strings"
 	"testing"
+
+	"github.com/OpenListTeam/OpenList/v4/drivers/base"
+	"github.com/go-resty/resty/v2"
 )
 
-func TestParseCookieString(t *testing.T) {
-	tests := []struct {
-		name           string
-		cookieStr      string
-		wantErr        bool
-		expectedToken  string
-		expectedUserID string
-		expectedSHash  string
-		expectedUHash  string
-	}{
-		{
-			name:           "完整的浏览器Cookie格式",
-			cookieStr:      `userId=1234567890; i.mi.com_ph=test-user-hash==; i.mi.com_isvalid_servicetoken=true; i.mi.com_istrudev=true; csrfToken=test-csrf-token; serviceToken=test-service-token+/=; i.mi.com_slh=test-session-hash=`,
-			wantErr:        false,
-			expectedToken:  "test-service-token+/=",
-			expectedUserID: "1234567890",
-			expectedSHash:  "test-session-hash=",
-			expectedUHash:  "test-user-hash==",
-		},
-		{
-			name:           "只包含必需字段的Cookie",
-			cookieStr:      `serviceToken=abc123; userId=12345; i.mi.com_slh=hash1; i.mi.com_ph=hash2`,
-			wantErr:        false,
-			expectedToken:  "abc123",
-			expectedUserID: "12345",
-			expectedSHash:  "hash1",
-			expectedUHash:  "hash2",
-		},
-		{
-			name:           "字段顺序不同",
-			cookieStr:      `i.mi.com_ph=hash2; i.mi.com_slh=hash1; userId=12345; serviceToken=abc123`,
-			wantErr:        false,
-			expectedToken:  "abc123",
-			expectedUserID: "12345",
-			expectedSHash:  "hash1",
-			expectedUHash:  "hash2",
-		},
-		{
-			name:           "带额外空格",
-			cookieStr:      `  serviceToken = abc123 ;  userId = 12345 ; i.mi.com_slh = hash1 ; i.mi.com_ph = hash2  `,
-			wantErr:        false,
-			expectedToken:  "abc123",
-			expectedUserID: "12345",
-			expectedSHash:  "hash1",
-			expectedUHash:  "hash2",
-		},
-		{
-			name:      "空字符串",
-			cookieStr: "",
-			wantErr:   true,
-		},
-		{
-			name:      "缺少serviceToken",
-			cookieStr: `userId=12345; i.mi.com_slh=hash1; i.mi.com_ph=hash2`,
-			wantErr:   true,
-		},
-		{
-			name:      "缺少userId",
-			cookieStr: `serviceToken=abc123; i.mi.com_slh=hash1; i.mi.com_ph=hash2`,
-			wantErr:   true,
-		},
-		{
-			name:      "缺少i.mi.com_slh",
-			cookieStr: `serviceToken=abc123; userId=12345; i.mi.com_ph=hash2`,
-			wantErr:   true,
-		},
-		{
-			name:      "缺少i.mi.com_ph",
-			cookieStr: `serviceToken=abc123; userId=12345; i.mi.com_slh=hash1`,
-			wantErr:   true,
-		},
-		{
-			name:      "格式错误的Cookie",
-			cookieStr: `invalidformat`,
-			wantErr:   true,
-		},
+func TestCookieHeaderHelpers(t *testing.T) {
+	cookies := parseCookieHeader("passToken=token+/=; userId=123456; malformed")
+	if !containsCookie(cookies, "passToken") || !containsCookie(cookies, "userId") {
+		t.Fatalf("failed to parse account cookies: %+v", cookies)
+	}
+	if containsCookie(cookies, "malformed") {
+		t.Fatal("malformed cookie was unexpectedly accepted")
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			serviceToken, userId, sessionHash, userHash, err := ParseCookieString(tt.cookieStr)
+	header := cookieHeader(cookies)
+	if !strings.Contains(header, "passToken=token+/=") || !strings.Contains(header, "userId=123456") {
+		t.Fatalf("unexpected serialized cookie header: %s", header)
+	}
+}
 
-			if (err != nil) != tt.wantErr {
-				t.Errorf("ParseCookieString() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
+func TestSessionCookiesApplyIgnoresDeletion(t *testing.T) {
+	session := sessionCookies{serviceToken: "old-service"}
+	updated := session.apply(parseCookieHeader("serviceToken=; userId=123456; i.mi.com_slh=session; i.mi.com_ph=user"))
+	if !updated {
+		t.Fatal("session was not updated")
+	}
+	if session.serviceToken != "old-service" {
+		t.Fatalf("serviceToken deletion replaced in-memory token: %q", session.serviceToken)
+	}
+	if !session.complete() {
+		t.Fatalf("session should be complete: %+v", session)
+	}
+}
 
-			if !tt.wantErr {
-				if serviceToken != tt.expectedToken {
-					t.Errorf("serviceToken = %v, want %v", serviceToken, tt.expectedToken)
-				}
-				if userId != tt.expectedUserID {
-					t.Errorf("userId = %v, want %v", userId, tt.expectedUserID)
-				}
-				if sessionHash != tt.expectedSHash {
-					t.Errorf("sessionHash = %v, want %v", sessionHash, tt.expectedSHash)
-				}
-				if userHash != tt.expectedUHash {
-					t.Errorf("userHash = %v, want %v", userHash, tt.expectedUHash)
-				}
-			}
-		})
+func TestRequestDoesNotSendSessionCookiesToOtherHosts(t *testing.T) {
+	previousClient := base.RestyClient
+	base.RestyClient = resty.New().SetRetryCount(0).SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if cookie := req.Header.Get("Cookie"); cookie != "" {
+			t.Fatalf("unexpected Cookie header for %s: %s", req.URL.Hostname(), cookie)
+		}
+		return testResponse(req, http.StatusOK, `{"commit_meta":"commit-1","stat":"BLOCK_COMPLETED"}`, nil), nil
+	}))
+	t.Cleanup(func() {
+		base.RestyClient = previousClient
+	})
+
+	driver := &XiaomiCloud{}
+	driver.setSession(sessionCookies{serviceToken: "service", userID: "user", sessionHash: "session", userHash: "hash"})
+	var resp UploadBlockResp
+	if _, err := driver.request("https://upload.example.test/node", http.MethodPost, nil, &resp); err != nil {
+		t.Fatalf("request() error = %v", err)
 	}
 }

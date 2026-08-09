@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -18,80 +20,61 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/go-resty/resty/v2"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/net/publicsuffix"
 )
 
 const (
-	BaseURL   = "https://i.mi.com"
-	APIPrefix = "/drive/v2/user"
-	UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-	Referer   = "https://i.mi.com/drive/h5"
-	ChunkSize = 4 * 1024 * 1024 // 4MB 分块大小
+	BaseURL          = "https://i.mi.com"
+	AccountBaseURL   = "https://account.xiaomi.com"
+	APIPrefix        = "/drive/v2/user"
+	UserAgent        = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	Referer          = "https://i.mi.com/drive/h5"
+	ChunkSize        = 4 * 1024 * 1024 // 4MB 分块大小
+	maxAuthRedirects = 10
 )
 
+type requestCallback func(req *resty.Request, serviceToken string)
+
+type sessionCookies struct {
+	serviceToken string
+	userID       string
+	sessionHash  string
+	userHash     string
+}
+
+var newXiaomiAuthClient = base.NewRestyClient
+
 // request 发送HTTP请求的通用方法
-func (d *XiaomiCloud) request(url string, method string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
-	req := base.RestyClient.R()
-
-	// 设置通用请求头
-	req.SetHeaders(map[string]string{
-		"User-Agent":      UserAgent,
-		"Referer":         Referer,
-		"Accept":          "*/*",
-		"Accept-Language": "zh-CN,zh;q=0.9",
-	})
-
-	// 设置Cookie认证
-	cookies := []*http.Cookie{
-		{Name: "serviceToken", Value: d.ServiceToken},
-		{Name: "userId", Value: d.UserID},
-		{Name: "i.mi.com_slh", Value: d.SessionHash},
-		{Name: "i.mi.com_ph", Value: d.UserHash},
-		{Name: "uLocale", Value: "zh_CN"},
-		{Name: "iplocale", Value: "zh_CN"},
-	}
-	req.SetCookies(cookies)
-
-	// 添加时间戳参数(所有请求都需要)
-	if !strings.Contains(url, "?") {
-		url += "?"
-	} else {
-		url += "&"
-	}
-	url += fmt.Sprintf("ts=%d", time.Now().UnixMilli())
-
-	// 执行回调设置额外参数
-	if callback != nil {
-		callback(req)
+func (d *XiaomiCloud) request(url string, method string, callback requestCallback, resp interface{}) ([]byte, error) {
+	if isXiaomiAPIURL(url) && d.sessionSnapshot().serviceToken == "" {
+		if err := d.ensureServiceToken(""); err != nil {
+			return nil, err
+		}
 	}
 
-	// 发送请求
-	var res *resty.Response
-	var err error
-	switch method {
-	case http.MethodGet:
-		res, err = req.Get(url)
-	case http.MethodPost:
-		res, err = req.Post(url)
-	case http.MethodPut:
-		res, err = req.Put(url)
-	case http.MethodDelete:
-		res, err = req.Delete(url)
-	default:
-		return nil, fmt.Errorf("不支持的HTTP方法: %s", method)
-	}
-
+	res, usedSession, err := d.doRequest(url, method, callback)
 	if err != nil {
 		return nil, err
 	}
 
-	// 检查HTTP状态码
+	if res.StatusCode() == http.StatusUnauthorized && isXiaomiAPIURL(url) {
+		if err = d.ensureServiceToken(usedSession.serviceToken); err != nil {
+			return nil, err
+		}
+		res, _, err = d.doRequest(url, method, callback)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	if res.StatusCode() != http.StatusOK {
+		if res.StatusCode() == http.StatusUnauthorized {
+			return nil, errs.NewErr(errs.EmptyToken, "account_cookie 无法续签有效的 serviceToken")
+		}
 		return nil, fmt.Errorf("HTTP错误: %d %s", res.StatusCode(), res.Status())
 	}
 
-	// 自动更新Cookie（从响应的Set-Cookie中提取）
-	d.updateCookieFromResponse(res)
-
+	d.updateSessionFromResponse(res)
 	body := res.Body()
 
 	// 小米KSS上传接口返回JSON响应体，但不设置Content-Type。
@@ -101,8 +84,6 @@ func (d *XiaomiCloud) request(url string, method string, callback base.ReqCallba
 			return body, fmt.Errorf("解析响应失败: %w", err)
 		}
 
-		// 检查API响应码
-		// 尝试解析错误响应
 		var errResp ErrorResp
 		if err := json.Unmarshal(body, &errResp); err == nil {
 			if errResp.Code != 0 && errResp.Result != "ok" {
@@ -115,92 +96,294 @@ func (d *XiaomiCloud) request(url string, method string, callback base.ReqCallba
 	return body, nil
 }
 
-// updateCookieFromResponse 从响应中提取并更新Cookie
-// 小米云盘的安全机制：每次API响应都会通过Set-Cookie刷新serviceToken和session_hash
-func (d *XiaomiCloud) updateCookieFromResponse(res *resty.Response) {
-	setCookies := res.Cookies()
-	if len(setCookies) == 0 {
-		return
+func (d *XiaomiCloud) doRequest(url string, method string, callback requestCallback) (*resty.Response, sessionCookies, error) {
+	req := base.RestyClient.R()
+	session := d.sessionSnapshot()
+
+	req.SetHeaders(map[string]string{
+		"User-Agent":      UserAgent,
+		"Referer":         Referer,
+		"Accept":          "*/*",
+		"Accept-Language": "zh-CN,zh;q=0.9",
+	})
+
+	if isXiaomiAPIURL(url) {
+		cookies := session.httpCookies()
+		cookies = append(cookies,
+			&http.Cookie{Name: "uLocale", Value: "zh_CN"},
+			&http.Cookie{Name: "iplocale", Value: "zh_CN"},
+		)
+		req.SetCookies(cookies)
 	}
 
-	updated := false
-	for _, cookie := range setCookies {
-		switch cookie.Name {
-		case "serviceToken":
-			if cookie.Value != "" && cookie.Value != d.ServiceToken {
-				log.Debug("[xiaomi_cloud] 服务令牌已更新")
-				d.ServiceToken = cookie.Value
-				updated = true
-			}
-		case "i.mi.com_slh":
-			if cookie.Value != "" && cookie.Value != d.SessionHash {
-				log.Debugf("[xiaomi_cloud] 会话哈希已更新: %s -> %s", d.SessionHash, cookie.Value)
-				d.SessionHash = cookie.Value
-				updated = true
-			}
-		case "userId":
-			// userId一般不变，但也更新以防万一
-			if cookie.Value != "" && cookie.Value != d.UserID {
-				log.Debugf("[xiaomi_cloud] 用户ID已更新: %s -> %s", d.UserID, cookie.Value)
-				d.UserID = cookie.Value
-				updated = true
-			}
-		case "i.mi.com_ph":
-			// user_hash一般不变，但也更新以防万一
-			if cookie.Value != "" && cookie.Value != d.UserHash {
-				log.Debugf("[xiaomi_cloud] 用户哈希已更新: %s -> %s", d.UserHash, cookie.Value)
-				d.UserHash = cookie.Value
-				updated = true
-			}
-		}
+	if !strings.Contains(url, "?") {
+		url += "?"
+	} else {
+		url += "&"
+	}
+	url += fmt.Sprintf("ts=%d", time.Now().UnixMilli())
+
+	if callback != nil {
+		callback(req, session.serviceToken)
 	}
 
-	if updated {
-		d.CookieString = mergeCookieString(d.CookieString, map[string]string{
-			"serviceToken": d.ServiceToken,
-			"userId":       d.UserID,
-			"i.mi.com_slh": d.SessionHash,
-			"i.mi.com_ph":  d.UserHash,
-		})
-		if d.ID != 0 {
-			op.MustSaveDriverStorage(d)
-		}
-		log.Infof("[xiaomi_cloud] Cookie已自动刷新")
+	var res *resty.Response
+	var err error
+	switch method {
+	case http.MethodGet:
+		res, err = req.Get(url)
+	case http.MethodPost:
+		res, err = req.Post(url)
+	case http.MethodPut:
+		res, err = req.Put(url)
+	case http.MethodDelete:
+		res, err = req.Delete(url)
+	default:
+		return nil, session, fmt.Errorf("不支持的HTTP方法: %s", method)
+	}
+
+	return res, session, err
+}
+
+func (d *XiaomiCloud) sessionSnapshot() sessionCookies {
+	d.sessionMu.RLock()
+	defer d.sessionMu.RUnlock()
+	return sessionCookies{
+		serviceToken: d.serviceToken,
+		userID:       d.userID,
+		sessionHash:  d.sessionHash,
+		userHash:     d.userHash,
 	}
 }
 
-func mergeCookieString(cookieString string, replacements map[string]string) string {
-	pairs := strings.Split(cookieString, ";")
-	result := make([]string, 0, len(pairs)+len(replacements))
-	seen := make(map[string]bool, len(replacements))
+func (d *XiaomiCloud) setSession(session sessionCookies) {
+	d.sessionMu.Lock()
+	d.serviceToken = session.serviceToken
+	d.userID = session.userID
+	d.sessionHash = session.sessionHash
+	d.userHash = session.userHash
+	d.sessionMu.Unlock()
+}
 
-	for _, pair := range pairs {
-		pair = strings.TrimSpace(pair)
-		if pair == "" {
-			continue
-		}
-		parts := strings.SplitN(pair, "=", 2)
-		if len(parts) != 2 {
-			result = append(result, pair)
-			continue
-		}
+func (d *XiaomiCloud) updateSessionFromResponse(res *resty.Response) {
+	session := d.sessionSnapshot()
+	updated := session.apply(res.Cookies())
+	if updated {
+		d.setSession(session)
+	}
+}
 
-		key := strings.TrimSpace(parts[0])
-		if value, ok := replacements[key]; ok {
-			result = append(result, key+"="+value)
-			seen[key] = true
-			continue
-		}
-		result = append(result, pair)
+func (d *XiaomiCloud) ensureServiceToken(staleToken string) error {
+	d.refreshMu.Lock()
+	defer d.refreshMu.Unlock()
+
+	currentToken := d.sessionSnapshot().serviceToken
+	if currentToken != "" && (staleToken == "" || currentToken != staleToken) {
+		return nil
 	}
 
-	for _, key := range []string{"userId", "i.mi.com_ph", "serviceToken", "i.mi.com_slh"} {
-		if value, ok := replacements[key]; ok && value != "" && !seen[key] {
-			result = append(result, key+"="+value)
-		}
+	if err := d.refreshServiceToken(); err != nil {
+		return errs.NewErr(errs.EmptyToken, "account_cookie 已失效或需要完成小米账号安全验证: %v", err)
+	}
+	return nil
+}
+
+func (d *XiaomiCloud) refreshServiceToken() error {
+	jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+	if err != nil {
+		return fmt.Errorf("创建 Cookie Jar 失败: %w", err)
 	}
 
-	return strings.Join(result, "; ")
+	accountURL, _ := url.Parse(AccountBaseURL + "/pass/serviceLogin")
+	cloudURL, _ := url.Parse(BaseURL + "/")
+	accountCookies := parseCookieHeader(d.AccountCookie)
+	if !containsCookie(accountCookies, "passToken") {
+		return fmt.Errorf("account_cookie 中缺少 passToken")
+	}
+	jar.SetCookies(accountURL, accountCookies)
+	jar.SetCookies(cloudURL, d.sessionSnapshot().httpCookies())
+
+	client := newXiaomiAuthClient().SetCookieJar(jar).SetRedirectPolicy(
+		resty.RedirectPolicyFunc(func(req *http.Request, via []*http.Request) error {
+			if len(via) >= maxAuthRedirects {
+				return fmt.Errorf("登录跳转次数超过限制")
+			}
+			switch strings.ToLower(req.URL.Hostname()) {
+			case "account.xiaomi.com", "i.mi.com":
+				return nil
+			default:
+				return fmt.Errorf("拒绝登录跳转到非小米域名")
+			}
+		}),
+	)
+
+	loginResp, err := client.R().
+		SetHeaders(map[string]string{
+			"User-Agent":      UserAgent,
+			"Referer":         Referer,
+			"Accept":          "application/json, text/plain, */*",
+			"Accept-Language": "zh-CN,zh;q=0.9",
+		}).
+		SetQueryParams(map[string]string{
+			"ts":       strconv.FormatInt(time.Now().UnixMilli(), 10),
+			"followUp": Referer,
+			"_locale":  "zh_CN",
+		}).
+		Get(BaseURL + "/api/user/login")
+	if err != nil {
+		return fmt.Errorf("获取登录地址失败: %w", err)
+	}
+	if loginResp.StatusCode() != http.StatusOK {
+		return fmt.Errorf("获取登录地址失败: HTTP %d", loginResp.StatusCode())
+	}
+
+	var loginResult struct {
+		Code int `json:"code"`
+		Data struct {
+			LoginURL string `json:"loginUrl"`
+		} `json:"data"`
+	}
+	if err = json.Unmarshal(loginResp.Body(), &loginResult); err != nil {
+		return fmt.Errorf("解析登录地址失败: %w", err)
+	}
+	if loginResult.Code != 0 || loginResult.Data.LoginURL == "" {
+		return fmt.Errorf("小米云盘未返回登录地址")
+	}
+
+	serviceLoginURL, err := url.Parse(loginResult.Data.LoginURL)
+	if err != nil || serviceLoginURL.Scheme != "https" || !strings.EqualFold(serviceLoginURL.Hostname(), "account.xiaomi.com") {
+		return fmt.Errorf("小米云盘返回了无效的登录地址")
+	}
+
+	serviceResp, err := client.R().
+		SetHeaders(map[string]string{
+			"User-Agent":      UserAgent,
+			"Referer":         Referer,
+			"Accept-Language": "zh-CN,zh;q=0.9",
+		}).
+		Get(serviceLoginURL.String())
+	if err != nil {
+		return fmt.Errorf("执行小米账号登录失败: %w", err)
+	}
+	if serviceResp.StatusCode() >= http.StatusBadRequest {
+		return fmt.Errorf("执行小米账号登录失败: HTTP %d", serviceResp.StatusCode())
+	}
+
+	newSession := sessionCookiesFromHTTP(jar.Cookies(cloudURL))
+	if !newSession.complete() {
+		return fmt.Errorf("账号登录未签发完整的云盘会话")
+	}
+
+	newAccountCookie := cookieHeader(jar.Cookies(accountURL))
+	d.sessionMu.Lock()
+	accountCookieChanged := newAccountCookie != "" && newAccountCookie != d.AccountCookie
+	if newAccountCookie != "" {
+		d.AccountCookie = newAccountCookie
+	}
+	d.serviceToken = newSession.serviceToken
+	d.userID = newSession.userID
+	d.sessionHash = newSession.sessionHash
+	d.userHash = newSession.userHash
+	d.sessionMu.Unlock()
+
+	if accountCookieChanged && d.ID != 0 {
+		op.MustSaveDriverStorage(d)
+	}
+	log.Infof("[xiaomi_cloud] serviceToken 已自动续签")
+	return nil
+}
+
+func (s sessionCookies) httpCookies() []*http.Cookie {
+	values := map[string]string{
+		"serviceToken": s.serviceToken,
+		"userId":       s.userID,
+		"i.mi.com_slh": s.sessionHash,
+		"i.mi.com_ph":  s.userHash,
+	}
+	cookies := make([]*http.Cookie, 0, len(values))
+	for _, name := range []string{"serviceToken", "userId", "i.mi.com_slh", "i.mi.com_ph"} {
+		if values[name] != "" {
+			cookies = append(cookies, &http.Cookie{Name: name, Value: values[name]})
+		}
+	}
+	return cookies
+}
+
+func (s *sessionCookies) apply(cookies []*http.Cookie) bool {
+	updated := false
+	for _, cookie := range cookies {
+		if cookie.Value == "" {
+			continue
+		}
+		switch cookie.Name {
+		case "serviceToken":
+			updated = updated || s.serviceToken != cookie.Value
+			s.serviceToken = cookie.Value
+		case "userId":
+			updated = updated || s.userID != cookie.Value
+			s.userID = cookie.Value
+		case "i.mi.com_slh":
+			updated = updated || s.sessionHash != cookie.Value
+			s.sessionHash = cookie.Value
+		case "i.mi.com_ph":
+			updated = updated || s.userHash != cookie.Value
+			s.userHash = cookie.Value
+		}
+	}
+	return updated
+}
+
+func (s sessionCookies) complete() bool {
+	return s.serviceToken != "" && s.userID != "" && s.sessionHash != "" && s.userHash != ""
+}
+
+func sessionCookiesFromHTTP(cookies []*http.Cookie) sessionCookies {
+	var session sessionCookies
+	session.apply(cookies)
+	return session
+}
+
+func parseCookieHeader(cookieString string) []*http.Cookie {
+	req := &http.Request{Header: make(http.Header)}
+	req.Header.Set("Cookie", cookieString)
+	return req.Cookies()
+}
+
+func containsCookie(cookies []*http.Cookie, name string) bool {
+	for _, cookie := range cookies {
+		if cookie.Name == name && cookie.Value != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasCookie(cookieString, name string) bool {
+	return containsCookie(parseCookieHeader(cookieString), name)
+}
+
+func cookieHeader(cookies []*http.Cookie) string {
+	values := make(map[string]string, len(cookies))
+	for _, cookie := range cookies {
+		if cookie.Name != "" && cookie.Value != "" {
+			values[cookie.Name] = cookie.Value
+		}
+	}
+	names := make([]string, 0, len(values))
+	for name := range values {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	pairs := make([]string, 0, len(names))
+	for _, name := range names {
+		pairs = append(pairs, (&http.Cookie{Name: name, Value: values[name]}).String())
+	}
+	return strings.Join(pairs, "; ")
+}
+
+func isXiaomiAPIURL(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	return err == nil && strings.EqualFold(parsed.Hostname(), "i.mi.com")
 }
 
 // getFiles 获取指定目录下的文件列表
@@ -213,7 +396,7 @@ func (d *XiaomiCloud) getFiles(parentID string) ([]File, error) {
 		var resp ListResp
 		apiURL := fmt.Sprintf("%s%s/folders/children", BaseURL, APIPrefix)
 
-		_, err := d.request(apiURL, http.MethodGet, func(req *resty.Request) {
+		_, err := d.request(apiURL, http.MethodGet, func(req *resty.Request, _ string) {
 			req.SetQueryParams(map[string]string{
 				"parentId": parentID,
 				"pageNo":   strconv.Itoa(pageNo),
@@ -289,7 +472,7 @@ func (d *XiaomiCloud) waitForTask(taskID string, maxWaitTime time.Duration) erro
 		}
 
 		var resp TaskQueryResp
-		_, err := d.request(apiURL, http.MethodGet, func(req *resty.Request) {
+		_, err := d.request(apiURL, http.MethodGet, func(req *resty.Request, _ string) {
 			req.SetQueryParam("taskId", taskID)
 		}, &resp)
 
@@ -396,7 +579,7 @@ func normalizeError(err error) error {
 	errMsg := err.Error()
 	// 检查特定错误码
 	if strings.Contains(errMsg, "code=401") || strings.Contains(errMsg, "未授权") {
-		return errs.NewErr(errs.EmptyToken, "Cookie已过期或无效,请重新提取")
+		return errs.NewErr(errs.EmptyToken, "account_cookie 已失效或需要重新提取")
 	}
 	if strings.Contains(errMsg, "code=403") || strings.Contains(errMsg, "禁止访问") {
 		return fmt.Errorf("访问被拒绝: %w", err)
@@ -405,63 +588,4 @@ func normalizeError(err error) error {
 		return errs.NewErr(errs.ObjectNotFound, "文件或文件夹不存在")
 	}
 	return err
-}
-
-// ParseCookieString 从完整的Cookie字符串中提取所需字段
-// 支持两种格式：
-// 1. 浏览器Cookie格式: "key1=value1; key2=value2; ..."
-// 2. HTTP请求头格式: "key1=value1; key2=value2; ..."
-func ParseCookieString(cookieStr string) (serviceToken, userId, sessionHash, userHash string, err error) {
-	if cookieStr == "" {
-		return "", "", "", "", fmt.Errorf("Cookie字符串为空")
-	}
-
-	// 解析Cookie键值对
-	cookieMap := make(map[string]string)
-
-	// 按分号分割Cookie项
-	pairs := strings.Split(cookieStr, ";")
-	for _, pair := range pairs {
-		pair = strings.TrimSpace(pair)
-		if pair == "" {
-			continue
-		}
-
-		// 按等号分割键值
-		parts := strings.SplitN(pair, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-
-		key := strings.TrimSpace(parts[0])
-		value := strings.TrimSpace(parts[1])
-		cookieMap[key] = value
-	}
-
-	// 提取所需字段
-	serviceToken = cookieMap["serviceToken"]
-	userId = cookieMap["userId"]
-	sessionHash = cookieMap["i.mi.com_slh"]
-	userHash = cookieMap["i.mi.com_ph"]
-
-	// 验证必需字段
-	missingFields := []string{}
-	if serviceToken == "" {
-		missingFields = append(missingFields, "serviceToken")
-	}
-	if userId == "" {
-		missingFields = append(missingFields, "userId")
-	}
-	if sessionHash == "" {
-		missingFields = append(missingFields, "i.mi.com_slh")
-	}
-	if userHash == "" {
-		missingFields = append(missingFields, "i.mi.com_ph")
-	}
-
-	if len(missingFields) > 0 {
-		return "", "", "", "", fmt.Errorf("Cookie中缺少必需字段: %s", strings.Join(missingFields, ", "))
-	}
-
-	return serviceToken, userId, sessionHash, userHash, nil
 }

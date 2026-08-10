@@ -111,7 +111,7 @@ jobs:
         run: |
           docker load --input "$IMAGE_ARCHIVE"
           docker image inspect "$IMAGE_TAG" >/dev/null
-          docker run --rm --platform linux/amd64 "$IMAGE_TAG" version
+          docker run --rm --platform linux/amd64 --entrypoint /entrypoint.sh "$IMAGE_TAG" version
 
       - name: Write image information
         shell: bash

@@ -1,6 +1,7 @@
 package xiaomi_cloud
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -76,7 +77,7 @@ func TestEnsureServiceTokenFromAccountCookie(t *testing.T) {
 	installAuthFlow(t, &serviceLoginCount)
 
 	driver := &XiaomiCloud{Addition: Addition{AccountCookie: "passToken=account-pass; userId=123456"}}
-	if err := driver.ensureServiceToken(""); err != nil {
+	if err := driver.ensureServiceToken(context.Background(), ""); err != nil {
 		t.Fatalf("ensureServiceToken() error = %v", err)
 	}
 
@@ -131,9 +132,9 @@ func TestRequestRefreshesAndRebuildsPostBody(t *testing.T) {
 	var result struct {
 		Code int `json:"code"`
 	}
-	_, err := driver.request(BaseURL+"/drive/v2/user/test", http.MethodPost, func(req *resty.Request, serviceToken string) {
+	_, err := driver.request(context.Background(), BaseURL+"/drive/v2/user/test", http.MethodPost, func(req *resty.Request, serviceToken string) {
 		req.SetHeader("Content-Type", "application/x-www-form-urlencoded")
-		req.SetBody(buildFormData(map[string]interface{}{"serviceToken": serviceToken}))
+		req.SetBody(buildFormData(map[string]string{"serviceToken": serviceToken}))
 	}, &result)
 	if err != nil {
 		t.Fatalf("request() error = %v", err)
@@ -183,7 +184,7 @@ func TestConcurrentUnauthorizedRequestsShareRefresh(t *testing.T) {
 			var result struct {
 				Code int `json:"code"`
 			}
-			_, err := driver.request(BaseURL+"/drive/v2/user/test", http.MethodGet, nil, &result)
+			_, err := driver.request(context.Background(), BaseURL+"/drive/v2/user/test", http.MethodGet, nil, &result)
 			errs <- err
 		}()
 	}

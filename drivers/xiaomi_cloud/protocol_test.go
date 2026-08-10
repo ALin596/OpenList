@@ -1,6 +1,7 @@
 package xiaomi_cloud
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -28,7 +29,7 @@ func TestRequestUnmarshalsJSONWithoutContentType(t *testing.T) {
 
 	driver := &XiaomiCloud{}
 	var resp UploadBlockResp
-	if _, err := driver.request(server.URL, http.MethodPost, nil, &resp); err != nil {
+	if _, err := driver.request(context.Background(), server.URL, http.MethodPost, nil, &resp); err != nil {
 		t.Fatalf("request without JSON Content-Type: %v", err)
 	}
 	if resp.Stat != "BLOCK_COMPLETED" || resp.CommitMeta != "commit-1" {
@@ -46,6 +47,9 @@ func TestIsRetriableError(t *testing.T) {
 		{name: "bad gateway", err: errors.New("HTTP错误: 502 502 Bad Gateway"), want: true},
 		{name: "service unavailable", err: errors.New("HTTP错误: 503 503 Service Unavailable"), want: true},
 		{name: "connection reset", err: errors.New("connection reset by peer"), want: true},
+		{name: "retriable api error", err: &apiError{code: 1, retriable: true}, want: true},
+		{name: "non-retriable api error", err: &apiError{code: 1}, want: false},
+		{name: "canceled", err: context.Canceled, want: false},
 		{name: "unauthorized", err: errors.New("HTTP错误: 401 401 Unauthorized"), want: false},
 	}
 

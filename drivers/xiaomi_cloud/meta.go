@@ -7,12 +7,10 @@ import (
 
 type Addition struct {
 	driver.RootID
-	AccountCookie string `json:"account_cookie" required:"true" type:"text" help:"account.xiaomi.com 请求中的完整 Cookie，必须包含 passToken"`
-
-	// 可选配置
+	AccountCookie  string `json:"account_cookie" required:"true" type:"text" help:"account.xiaomi.com 请求中的完整 Cookie，必须包含 passToken"`
 	OrderBy        string `json:"order_by" type:"select" options:"SERVICE_TIME,NAME,SIZE,CREATE_TIME,MODIFY_TIME" default:"SERVICE_TIME" help:"文件排序字段"`
 	OrderDirection string `json:"order_direction" type:"select" options:"ASC,DESC" default:"DESC" help:"排序方向"`
-	RapidUpload    bool   `json:"rapid_upload" default:"true" help:"启用秒传功能(基于SHA1去重)"`
+	UploadThread   int    `json:"upload_thread" type:"number" default:"4" help:"分块上传并发数，范围 1-32"`
 }
 
 var config = driver.Config{
@@ -35,8 +33,8 @@ var config = driver.Config{
 
 特性：
 - 自动获取并续签小米云盘 serviceToken
-- 支持秒传功能(相同SHA1的文件无需重复上传)
-- 支持大文件分块上传(4MB块)
+- 支持基于SHA1的秒传
+- 支持大文件4MB分块并发上传
 - 支持CDN加速下载
 - 支持完整的文件管理操作`,
 }

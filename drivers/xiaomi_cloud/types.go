@@ -1,7 +1,6 @@
 package xiaomi_cloud
 
 import (
-	"strconv"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
@@ -235,40 +234,11 @@ type RenameResp struct {
 	TS          int64  `json:"ts"`
 }
 
-// SearchResp 搜索响应
-type SearchResp struct {
+// ErrorResp 错误响应
+type ErrorResp struct {
 	Result      string `json:"result"`
 	Retriable   bool   `json:"retriable"`
 	Code        int    `json:"code"`
 	Description string `json:"description"`
-	TS          int64  `json:"ts"`
-	Data        struct {
-		Records  []File `json:"records"`
-		HasMore  bool   `json:"hasMore"`
-		AllCount int    `json:"allCount"`
-	} `json:"data"`
-}
-
-// ErrorResp 错误响应
-type ErrorResp struct {
-	Result      string `json:"result"`
-	Code        int    `json:"code"`
-	Description string `json:"description"`
 	Message     string `json:"message"`
-}
-
-// getParentIDString 统一处理parentId字段(可能是数字0或字符串)
-func getParentIDString(parentID interface{}) string {
-	switch v := parentID.(type) {
-	case string:
-		return v
-	case float64:
-		return strconv.FormatInt(int64(v), 10)
-	case int64:
-		return strconv.FormatInt(v, 10)
-	case int:
-		return strconv.Itoa(v)
-	default:
-		return "0"
-	}
 }

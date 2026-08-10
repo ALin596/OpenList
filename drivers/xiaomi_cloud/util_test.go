@@ -1,6 +1,7 @@
 package xiaomi_cloud
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"testing"
@@ -53,7 +54,7 @@ func TestRequestDoesNotSendSessionCookiesToOtherHosts(t *testing.T) {
 	driver := &XiaomiCloud{}
 	driver.setSession(sessionCookies{serviceToken: "service", userID: "user", sessionHash: "session", userHash: "hash"})
 	var resp UploadBlockResp
-	if _, err := driver.request("https://upload.example.test/node", http.MethodPost, nil, &resp); err != nil {
+	if _, err := driver.request(context.Background(), "https://upload.example.test/node", http.MethodPost, nil, &resp); err != nil {
 		t.Fatalf("request() error = %v", err)
 	}
 }

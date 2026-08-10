@@ -32,37 +32,12 @@ var newXiaomiAuthClient = base.NewRestyClient
 func (d *XiaomiCloud) sessionSnapshot() sessionCookies {
 	d.sessionMu.RLock()
 	defer d.sessionMu.RUnlock()
-	return sessionCookies{
-		serviceToken: d.serviceToken,
-		userID:       d.userID,
-		sessionHash:  d.sessionHash,
-		userHash:     d.userHash,
-	}
-}
-
-func (d *XiaomiCloud) setSession(session sessionCookies) {
-	d.sessionMu.Lock()
-	d.serviceToken = session.serviceToken
-	d.userID = session.userID
-	d.sessionHash = session.sessionHash
-	d.userHash = session.userHash
-	d.sessionMu.Unlock()
+	return d.session
 }
 
 func (d *XiaomiCloud) updateSessionFromResponse(res *resty.Response) {
 	d.sessionMu.Lock()
-	session := sessionCookies{
-		serviceToken: d.serviceToken,
-		userID:       d.userID,
-		sessionHash:  d.sessionHash,
-		userHash:     d.userHash,
-	}
-	if session.apply(res.Cookies()) {
-		d.serviceToken = session.serviceToken
-		d.userID = session.userID
-		d.sessionHash = session.sessionHash
-		d.userHash = session.userHash
-	}
+	d.session.apply(res.Cookies())
 	d.sessionMu.Unlock()
 }
 
@@ -92,8 +67,8 @@ func (d *XiaomiCloud) refreshServiceToken(ctx context.Context) error {
 		return fmt.Errorf("创建 Cookie Jar 失败: %w", err)
 	}
 
-	accountURL, _ := url.Parse(AccountBaseURL + "/pass/serviceLogin")
-	cloudURL, _ := url.Parse(BaseURL + "/")
+	accountURL, _ := url.Parse(accountBaseURL + "/pass/serviceLogin")
+	cloudURL, _ := url.Parse(baseURL + "/")
 	accountCookies := parseCookieHeader(d.AccountCookie)
 	if !containsCookie(accountCookies, "passToken") {
 		return fmt.Errorf("account_cookie 中缺少 passToken")
@@ -118,17 +93,17 @@ func (d *XiaomiCloud) refreshServiceToken(ctx context.Context) error {
 	loginResp, err := client.R().
 		SetContext(ctx).
 		SetHeaders(map[string]string{
-			"User-Agent":      UserAgent,
-			"Referer":         Referer,
+			"User-Agent":      userAgent,
+			"Referer":         referer,
 			"Accept":          "application/json, text/plain, */*",
 			"Accept-Language": "zh-CN,zh;q=0.9",
 		}).
 		SetQueryParams(map[string]string{
 			"ts":       strconv.FormatInt(time.Now().UnixMilli(), 10),
-			"followUp": Referer,
+			"followUp": referer,
 			"_locale":  "zh_CN",
 		}).
-		Get(BaseURL + "/api/user/login")
+		Get(baseURL + "/api/user/login")
 	if err != nil {
 		return fmt.Errorf("获取登录地址失败: %w", err)
 	}
@@ -156,8 +131,8 @@ func (d *XiaomiCloud) refreshServiceToken(ctx context.Context) error {
 	serviceResp, err := client.R().
 		SetContext(ctx).
 		SetHeaders(map[string]string{
-			"User-Agent":      UserAgent,
-			"Referer":         Referer,
+			"User-Agent":      userAgent,
+			"Referer":         referer,
 			"Accept-Language": "zh-CN,zh;q=0.9",
 		}).
 		Get(serviceLoginURL.String())
@@ -178,10 +153,7 @@ func (d *XiaomiCloud) refreshServiceToken(ctx context.Context) error {
 	if newAccountCookie != "" {
 		d.AccountCookie = newAccountCookie
 	}
-	d.serviceToken = newSession.serviceToken
-	d.userID = newSession.userID
-	d.sessionHash = newSession.sessionHash
-	d.userHash = newSession.userHash
+	d.session = newSession
 	d.sessionMu.Unlock()
 
 	if accountCookieChanged && d.ID != 0 {
@@ -207,28 +179,22 @@ func (s sessionCookies) httpCookies() []*http.Cookie {
 	return cookies
 }
 
-func (s *sessionCookies) apply(cookies []*http.Cookie) bool {
-	updated := false
+func (s *sessionCookies) apply(cookies []*http.Cookie) {
 	for _, cookie := range cookies {
 		if cookie.Value == "" {
 			continue
 		}
 		switch cookie.Name {
 		case "serviceToken":
-			updated = updated || s.serviceToken != cookie.Value
 			s.serviceToken = cookie.Value
 		case "userId":
-			updated = updated || s.userID != cookie.Value
 			s.userID = cookie.Value
 		case "i.mi.com_slh":
-			updated = updated || s.sessionHash != cookie.Value
 			s.sessionHash = cookie.Value
 		case "i.mi.com_ph":
-			updated = updated || s.userHash != cookie.Value
 			s.userHash = cookie.Value
 		}
 	}
-	return updated
 }
 
 func (s sessionCookies) complete() bool {

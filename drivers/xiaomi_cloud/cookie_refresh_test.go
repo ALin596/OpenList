@@ -34,6 +34,12 @@ func testResponse(req *http.Request, status int, body string, header http.Header
 	}
 }
 
+func setTestSession(driver *XiaomiCloud, session sessionCookies) {
+	driver.sessionMu.Lock()
+	driver.session = session
+	driver.sessionMu.Unlock()
+}
+
 func installAuthFlow(t *testing.T, serviceLoginCount *atomic.Int32) {
 	t.Helper()
 	previousFactory := newXiaomiAuthClient
@@ -127,14 +133,13 @@ func TestRequestRefreshesAndRebuildsPostBody(t *testing.T) {
 	})
 
 	driver := &XiaomiCloud{Addition: Addition{AccountCookie: "passToken=account-pass; userId=123456"}}
-	driver.setSession(sessionCookies{serviceToken: "old-service", userID: "123456", sessionHash: "old-session", userHash: "old-user"})
+	setTestSession(driver, sessionCookies{serviceToken: "old-service", userID: "123456", sessionHash: "old-session", userHash: "old-user"})
 
 	var result struct {
 		Code int `json:"code"`
 	}
-	_, err := driver.request(context.Background(), BaseURL+"/drive/v2/user/test", http.MethodPost, func(req *resty.Request, serviceToken string) {
-		req.SetHeader("Content-Type", "application/x-www-form-urlencoded")
-		req.SetBody(buildFormData(map[string]string{"serviceToken": serviceToken}))
+	err := driver.request(context.Background(), baseURL+"/drive/v2/user/test", http.MethodPost, func(req *resty.Request, serviceToken string) {
+		req.SetFormData(map[string]string{"serviceToken": serviceToken})
 	}, &result)
 	if err != nil {
 		t.Fatalf("request() error = %v", err)
@@ -176,7 +181,7 @@ func TestConcurrentUnauthorizedRequestsShareRefresh(t *testing.T) {
 	})
 
 	driver := &XiaomiCloud{Addition: Addition{AccountCookie: "passToken=account-pass; userId=123456"}}
-	driver.setSession(sessionCookies{serviceToken: "old-service", userID: "123456", sessionHash: "old-session", userHash: "old-user"})
+	setTestSession(driver, sessionCookies{serviceToken: "old-service", userID: "123456", sessionHash: "old-session", userHash: "old-user"})
 
 	errs := make(chan error, 2)
 	for range 2 {
@@ -184,7 +189,7 @@ func TestConcurrentUnauthorizedRequestsShareRefresh(t *testing.T) {
 			var result struct {
 				Code int `json:"code"`
 			}
-			_, err := driver.request(context.Background(), BaseURL+"/drive/v2/user/test", http.MethodGet, nil, &result)
+			err := driver.request(context.Background(), baseURL+"/drive/v2/user/test", http.MethodGet, nil, &result)
 			errs <- err
 		}()
 	}

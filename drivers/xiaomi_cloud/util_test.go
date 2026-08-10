@@ -27,10 +27,7 @@ func TestCookieHeaderHelpers(t *testing.T) {
 
 func TestSessionCookiesApplyIgnoresDeletion(t *testing.T) {
 	session := sessionCookies{serviceToken: "old-service"}
-	updated := session.apply(parseCookieHeader("serviceToken=; userId=123456; i.mi.com_slh=session; i.mi.com_ph=user"))
-	if !updated {
-		t.Fatal("session was not updated")
-	}
+	session.apply(parseCookieHeader("serviceToken=; userId=123456; i.mi.com_slh=session; i.mi.com_ph=user"))
 	if session.serviceToken != "old-service" {
 		t.Fatalf("serviceToken deletion replaced in-memory token: %q", session.serviceToken)
 	}
@@ -52,9 +49,9 @@ func TestRequestDoesNotSendSessionCookiesToOtherHosts(t *testing.T) {
 	})
 
 	driver := &XiaomiCloud{}
-	driver.setSession(sessionCookies{serviceToken: "service", userID: "user", sessionHash: "session", userHash: "hash"})
-	var resp UploadBlockResp
-	if _, err := driver.request(context.Background(), "https://upload.example.test/node", http.MethodPost, nil, &resp); err != nil {
+	setTestSession(driver, sessionCookies{serviceToken: "service", userID: "user", sessionHash: "session", userHash: "hash"})
+	var resp uploadBlockResponse
+	if err := driver.request(context.Background(), "https://upload.example.test/node", http.MethodPost, nil, &resp); err != nil {
 		t.Fatalf("request() error = %v", err)
 	}
 }

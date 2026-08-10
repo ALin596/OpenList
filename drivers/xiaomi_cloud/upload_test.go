@@ -40,19 +40,19 @@ func TestUploadHasherBuildsOrderedBlockManifest(t *testing.T) {
 		t.Fatalf("file SHA1 = %q", manifest.fileSHA1)
 	}
 	wantBlocks := [][]byte{data[:4], data[4:8], data[8:]}
-	if len(manifest.blockInfo) != len(wantBlocks) {
-		t.Fatalf("block count = %d, want %d", len(manifest.blockInfo), len(wantBlocks))
+	if len(manifest.blocks) != len(wantBlocks) {
+		t.Fatalf("block count = %d, want %d", len(manifest.blocks), len(wantBlocks))
 	}
 	for index, block := range wantBlocks {
-		got := manifest.blockInfo[index]
-		if got.Size != int64(len(block)) || got.Sha1 != hashHex(sha1.New(), block) || got.MD5 != hashHex(md5.New(), block) {
+		got := manifest.blocks[index]
+		if got.Size != int64(len(block)) || got.SHA1 != hashHex(sha1.New(), block) || got.MD5 != hashHex(md5.New(), block) {
 			t.Fatalf("block %d = %+v", index, got)
 		}
 	}
 }
 
 func TestPutUploadsBlocksConcurrentlyAndCommitsInOrder(t *testing.T) {
-	data := make([]byte, 2*ChunkSize+321)
+	data := make([]byte, 2*chunkSize+321)
 	for index := range data {
 		data[index] = byte(index % 251)
 	}
@@ -60,11 +60,11 @@ func TestPutUploadsBlocksConcurrentlyAndCommitsInOrder(t *testing.T) {
 	var active atomic.Int32
 	var maxActive atomic.Int32
 	var commitMu sync.Mutex
-	var committed []CommitMeta
+	var committed []commitMeta
 	previousClient := base.RestyClient
 	base.RestyClient = resty.New().SetRetryCount(0).SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		switch req.URL.Path {
-		case APIPrefix + "/files/create":
+		case apiPrefix + "/files/create":
 			return testResponse(req, http.StatusOK, `{
 				"result":"ok","code":0,"data":{
 					"uploadId":"upload-1","exists":false,
@@ -90,8 +90,8 @@ func TestPutUploadsBlocksConcurrentlyAndCommitsInOrder(t *testing.T) {
 			if err != nil {
 				return nil, err
 			}
-			offset := int64(blockIndex) * ChunkSize
-			end := min(offset+ChunkSize, int64(len(data)))
+			offset := int64(blockIndex) * chunkSize
+			end := min(offset+chunkSize, int64(len(data)))
 			if !bytes.Equal(body, data[offset:end]) {
 				return nil, fmt.Errorf("block %d body mismatch", blockIndex)
 			}
@@ -101,12 +101,12 @@ func TestPutUploadsBlocksConcurrentlyAndCommitsInOrder(t *testing.T) {
 			time.Sleep(40 * time.Millisecond)
 			return testResponse(req, http.StatusOK,
 				fmt.Sprintf(`{"commit_meta":"commit-%d","stat":"BLOCK_COMPLETED"}`, blockIndex), nil), nil
-		case APIPrefix + "/files/commit":
+		case apiPrefix + "/files/commit":
 			form, err := readRequestForm(req)
 			if err != nil {
 				return nil, err
 			}
-			var metas []CommitMeta
+			var metas []commitMeta
 			if err = json.Unmarshal([]byte(form.Get("commit_metas")), &metas); err != nil {
 				return nil, err
 			}
@@ -123,7 +123,7 @@ func TestPutUploadsBlocksConcurrentlyAndCommitsInOrder(t *testing.T) {
 	})
 
 	driver := &XiaomiCloud{Addition: Addition{UploadThread: 2}}
-	driver.setSession(sessionCookies{serviceToken: "service", userID: "user", sessionHash: "session", userHash: "hash"})
+	setTestSession(driver, sessionCookies{serviceToken: "service", userID: "user", sessionHash: "session", userHash: "hash"})
 	stream := &streamPkg.FileStream{
 		Obj:      &model.Object{Name: "large.bin", Size: int64(len(data))},
 		Reader:   bytes.NewReader(data),
@@ -161,7 +161,7 @@ func TestRequestHonorsCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	driver := &XiaomiCloud{}
-	_, err := driver.request(ctx, "https://upload.example.test/node", http.MethodPost, nil, nil)
+	err := driver.request(ctx, "https://upload.example.test/node", http.MethodPost, nil, nil)
 	if err == nil || !errors.Is(err, context.Canceled) {
 		t.Fatalf("request() error = %v, want context.Canceled", err)
 	}
@@ -190,13 +190,13 @@ func TestUploadBlockRetryRestartsSectionReader(t *testing.T) {
 
 	driver := &XiaomiCloud{Addition: Addition{UploadThread: 1}}
 	manifest := uploadManifest{
-		fileSize:  int64(len(data)),
-		blockInfo: []BlockInfo{{Size: int64(len(data))}},
+		fileSize: int64(len(data)),
+		blocks:   []blockInfo{{Size: int64(len(data))}},
 	}
 	session := uploadSession{
 		fileMeta:   "file-meta",
 		nodeURLs:   []string{"https://upload.example.test/node"},
-		blockMetas: []UploadBlockMeta{{BlockMeta: "block-0"}},
+		blockMetas: []uploadBlockMeta{{BlockMeta: "block-0"}},
 	}
 	metas, err := driver.uploadBlocks(context.Background(), bytes.NewReader(data), manifest, session, func(float64) {})
 	if err != nil {

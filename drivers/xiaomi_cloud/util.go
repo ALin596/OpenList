@@ -10,12 +10,12 @@ import (
 	"github.com/go-resty/resty/v2"
 )
 
-func (d *XiaomiCloud) getFiles(ctx context.Context, parentID string) ([]File, error) {
-	var allFiles []File
+func (d *XiaomiCloud) getFiles(ctx context.Context, parentID string) ([]file, error) {
+	var allFiles []file
 	for pageNo := 1; ; pageNo++ {
-		var resp ListResp
-		apiURL := fmt.Sprintf("%s%s/folders/children", BaseURL, APIPrefix)
-		_, err := d.request(ctx, apiURL, http.MethodGet, func(req *resty.Request, _ string) {
+		var resp listResponse
+		apiURL := fmt.Sprintf("%s%s/folders/children", baseURL, apiPrefix)
+		err := d.request(ctx, apiURL, http.MethodGet, func(req *resty.Request, _ string) {
 			req.SetQueryParams(map[string]string{
 				"parentId": parentID,
 				"pageNo":   strconv.Itoa(pageNo),
@@ -28,9 +28,6 @@ func (d *XiaomiCloud) getFiles(ctx context.Context, parentID string) ([]File, er
 		if err != nil {
 			return nil, err
 		}
-		if resp.Code != 0 {
-			return nil, fmt.Errorf("获取文件列表失败: %s", resp.Description)
-		}
 		allFiles = append(allFiles, resp.Data.Records...)
 		if !resp.Data.HasMore {
 			return allFiles, nil
@@ -42,11 +39,11 @@ func (d *XiaomiCloud) waitForTask(ctx context.Context, taskID string, maxWaitTim
 	taskCtx, cancel := context.WithTimeout(ctx, maxWaitTime)
 	defer cancel()
 
-	apiURL := fmt.Sprintf("%s%s/records/taskquery", BaseURL, APIPrefix)
+	apiURL := fmt.Sprintf("%s%s/records/taskquery", baseURL, apiPrefix)
 	interval := 200 * time.Millisecond
 	for {
-		var resp TaskQueryResp
-		_, err := d.request(taskCtx, apiURL, http.MethodGet, func(req *resty.Request, _ string) {
+		var resp taskQueryResponse
+		err := d.request(taskCtx, apiURL, http.MethodGet, func(req *resty.Request, _ string) {
 			req.SetQueryParam("taskId", taskID)
 		}, &resp)
 		if err != nil {
@@ -57,9 +54,6 @@ func (d *XiaomiCloud) waitForTask(ctx context.Context, taskID string, maxWaitTim
 				return fmt.Errorf("任务超时: taskId=%s", taskID)
 			}
 			return err
-		}
-		if resp.Code != 0 {
-			return fmt.Errorf("查询任务失败: %s", resp.Description)
 		}
 		done, statusErr := evaluateTaskStatus(resp.Data.Status, taskID)
 		if statusErr != nil || done {

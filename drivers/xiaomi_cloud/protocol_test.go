@@ -7,9 +7,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/go-resty/resty/v2"
 )
@@ -28,12 +30,31 @@ func TestRequestUnmarshalsJSONWithoutContentType(t *testing.T) {
 	defer server.Close()
 
 	driver := &XiaomiCloud{}
-	var resp UploadBlockResp
-	if _, err := driver.request(context.Background(), server.URL, http.MethodPost, nil, &resp); err != nil {
+	var resp uploadBlockResponse
+	if err := driver.request(context.Background(), server.URL, http.MethodPost, nil, &resp); err != nil {
 		t.Fatalf("request without JSON Content-Type: %v", err)
 	}
 	if resp.Stat != "BLOCK_COMPLETED" || resp.CommitMeta != "commit-1" {
 		t.Fatalf("upload block response = %+v", resp)
+	}
+}
+
+func TestRequestValidatesJSONWithoutResponseTarget(t *testing.T) {
+	previousClient := base.RestyClient
+	base.RestyClient = resty.New()
+	t.Cleanup(func() {
+		base.RestyClient = previousClient
+	})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("not-json"))
+	}))
+	defer server.Close()
+
+	err := (&XiaomiCloud{}).request(context.Background(), server.URL, http.MethodPost, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "解析响应失败") {
+		t.Fatalf("request malformed response error = %v", err)
 	}
 }
 
@@ -43,20 +64,39 @@ func TestIsRetriableError(t *testing.T) {
 		err  error
 		want bool
 	}{
-		{name: "gateway timeout", err: errors.New("HTTP错误: 504 504 Gateway Timeout"), want: true},
-		{name: "bad gateway", err: errors.New("HTTP错误: 502 502 Bad Gateway"), want: true},
-		{name: "service unavailable", err: errors.New("HTTP错误: 503 503 Service Unavailable"), want: true},
+		{name: "gateway timeout", err: &httpStatusError{code: http.StatusGatewayTimeout}, want: true},
+		{name: "bad gateway", err: &httpStatusError{code: http.StatusBadGateway}, want: true},
+		{name: "service unavailable", err: &httpStatusError{code: http.StatusServiceUnavailable}, want: true},
 		{name: "connection reset", err: errors.New("connection reset by peer"), want: true},
 		{name: "retriable api error", err: &apiError{code: 1, retriable: true}, want: true},
 		{name: "non-retriable api error", err: &apiError{code: 1}, want: false},
 		{name: "canceled", err: context.Canceled, want: false},
-		{name: "unauthorized", err: errors.New("HTTP错误: 401 401 Unauthorized"), want: false},
+		{name: "unauthorized", err: &httpStatusError{code: http.StatusUnauthorized}, want: false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := isRetriableError(tt.err); got != tt.want {
 				t.Fatalf("isRetriableError(%q) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeErrorUsesTypedCodes(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want error
+	}{
+		{name: "API unauthorized", err: &apiError{code: http.StatusUnauthorized}, want: errs.EmptyToken},
+		{name: "HTTP not found", err: &httpStatusError{code: http.StatusNotFound}, want: errs.ObjectNotFound},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := normalizeError(tt.err); !errors.Is(err, tt.want) {
+				t.Fatalf("normalizeError(%v) = %v, want errors.Is(_, %v)", tt.err, err, tt.want)
 			}
 		})
 	}
@@ -85,7 +125,7 @@ func TestEvaluateTaskStatus(t *testing.T) {
 	}
 }
 
-func TestCreateUploadRespUnmarshalChunkedUpload(t *testing.T) {
+func TestCreateUploadResponseUnmarshalChunkedUpload(t *testing.T) {
 	fixture := `{
 		"result":"ok",
 		"retriable":false,
@@ -108,7 +148,7 @@ func TestCreateUploadRespUnmarshalChunkedUpload(t *testing.T) {
 		}
 	}`
 
-	var resp CreateUploadResp
+	var resp createUploadResponse
 	if err := json.Unmarshal([]byte(fixture), &resp); err != nil {
 		t.Fatalf("unmarshal chunked upload response: %v", err)
 	}
@@ -116,21 +156,21 @@ func TestCreateUploadRespUnmarshalChunkedUpload(t *testing.T) {
 	if resp.Data.Exists {
 		t.Fatal("chunked upload response unexpectedly marked as rapid upload")
 	}
-	if resp.Data.Kss.FileMeta != "file-meta" {
-		t.Fatalf("file_meta = %q, want %q", resp.Data.Kss.FileMeta, "file-meta")
+	if resp.Data.KSS.FileMeta != "file-meta" {
+		t.Fatalf("file_meta = %q, want %q", resp.Data.KSS.FileMeta, "file-meta")
 	}
-	if len(resp.Data.Kss.NodeURLs) != 1 {
-		t.Fatalf("node_urls length = %d, want 1", len(resp.Data.Kss.NodeURLs))
+	if len(resp.Data.KSS.NodeURLs) != 1 {
+		t.Fatalf("node_urls length = %d, want 1", len(resp.Data.KSS.NodeURLs))
 	}
-	if len(resp.Data.Kss.BlockMetas) != 2 {
-		t.Fatalf("block_metas length = %d, want 2", len(resp.Data.Kss.BlockMetas))
+	if len(resp.Data.KSS.BlockMetas) != 2 {
+		t.Fatalf("block_metas length = %d, want 2", len(resp.Data.KSS.BlockMetas))
 	}
-	if got := resp.Data.Kss.BlockMetas[1]; got.BlockMeta != "block-2" || got.IsExisted != 1 {
-		t.Fatalf("second block meta = %+v, want block-2 with is_existed=1", got)
+	if got := resp.Data.KSS.BlockMetas[1]; got.BlockMeta != "block-2" {
+		t.Fatalf("second block meta = %+v, want block-2", got)
 	}
 }
 
-func TestCreateUploadRespUnmarshalRapidUpload(t *testing.T) {
+func TestCreateUploadResponseUnmarshalRapidUpload(t *testing.T) {
 	fixture := `{
 		"result":"ok",
 		"retriable":false,
@@ -140,43 +180,12 @@ func TestCreateUploadRespUnmarshalRapidUpload(t *testing.T) {
 		"data":{"exists":true,"id":"file-1","uploadId":"upload-1"}
 	}`
 
-	var resp CreateUploadResp
+	var resp createUploadResponse
 	if err := json.Unmarshal([]byte(fixture), &resp); err != nil {
 		t.Fatalf("unmarshal rapid upload response: %v", err)
 	}
 	if !resp.Data.Exists || resp.Data.ID != "file-1" {
 		t.Fatalf("rapid upload data = %+v", resp.Data)
-	}
-}
-
-func TestFileInfoRespUnmarshalKSSBlocks(t *testing.T) {
-	fixture := `{
-		"result":"ok",
-		"code":0,
-		"data":{
-			"id":"file-1",
-			"storage":{
-				"downloadUrl":"https://download.example.test/file",
-				"expireAt":1,
-				"kss":{
-					"blocks":[{"idc_name":"idc-1","sha1":"sha1","size":4194304,"urls":["https://download.example.test/block"]}],
-					"secure_key":"secure-key",
-					"stat":"OK"
-				}
-			}
-		}
-	}`
-
-	var resp FileInfoResp
-	if err := json.Unmarshal([]byte(fixture), &resp); err != nil {
-		t.Fatalf("unmarshal file info response: %v", err)
-	}
-	if len(resp.Data.Storage.Kss.Blocks) != 1 {
-		t.Fatalf("KSS blocks length = %d, want 1", len(resp.Data.Storage.Kss.Blocks))
-	}
-	block := resp.Data.Storage.Kss.Blocks[0]
-	if block.IDCName != "idc-1" || len(block.URLs) != 1 {
-		t.Fatalf("KSS block = %+v", block)
 	}
 }
 
@@ -220,7 +229,7 @@ func TestGetFileManagerRecordType(t *testing.T) {
 }
 
 func TestFileManagerRecordJSONShape(t *testing.T) {
-	moveRecord, err := json.Marshal(FileManagerRecord{ID: "file-1", ParentID: "folder-1", Type: "other"})
+	moveRecord, err := json.Marshal(fileManagerRecord{ID: "file-1", ParentID: "folder-1", Type: "other"})
 	if err != nil {
 		t.Fatalf("marshal move record: %v", err)
 	}
@@ -228,7 +237,7 @@ func TestFileManagerRecordJSONShape(t *testing.T) {
 		t.Fatalf("move record JSON = %s", moveRecord)
 	}
 
-	deleteRecord, err := json.Marshal(FileManagerRecord{ID: "file-1", Type: "other"})
+	deleteRecord, err := json.Marshal(fileManagerRecord{ID: "file-1", Type: "other"})
 	if err != nil {
 		t.Fatalf("marshal delete record: %v", err)
 	}

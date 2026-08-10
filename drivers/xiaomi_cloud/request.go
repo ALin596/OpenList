@@ -20,11 +20,11 @@ import (
 )
 
 const (
-	BaseURL          = "https://i.mi.com"
-	AccountBaseURL   = "https://account.xiaomi.com"
-	APIPrefix        = "/drive/v2/user"
-	UserAgent        = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-	Referer          = "https://i.mi.com/drive/h5"
+	baseURL          = "https://i.mi.com"
+	accountBaseURL   = "https://account.xiaomi.com"
+	apiPrefix        = "/drive/v2/user"
+	userAgent        = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	referer          = "https://i.mi.com/drive/h5"
 	maxAuthRedirects = 10
 )
 
@@ -49,60 +49,63 @@ func (e *apiError) Error() string {
 	return fmt.Sprintf("API错误: code=%d, msg=%s", e.code, e.description)
 }
 
-func (d *XiaomiCloud) request(ctx context.Context, rawURL, method string, callback requestCallback, resp interface{}) ([]byte, error) {
+func (d *XiaomiCloud) request(ctx context.Context, rawURL, method string, callback requestCallback, resp any) error {
 	if isXiaomiAPIURL(rawURL) && d.sessionSnapshot().serviceToken == "" {
 		if err := d.ensureServiceToken(ctx, ""); err != nil {
-			return nil, err
+			return err
 		}
 	}
 
 	res, usedSession, err := d.doRequest(ctx, rawURL, method, callback)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if res.StatusCode() == http.StatusUnauthorized && isXiaomiAPIURL(rawURL) {
 		if err = d.ensureServiceToken(ctx, usedSession.serviceToken); err != nil {
-			return nil, err
+			return err
 		}
 		res, _, err = d.doRequest(ctx, rawURL, method, callback)
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 
 	if res.StatusCode() != http.StatusOK {
 		if res.StatusCode() == http.StatusUnauthorized {
-			return nil, errs.NewErr(errs.EmptyToken, "account_cookie 无法续签有效的 serviceToken")
+			return errs.NewErr(errs.EmptyToken, "account_cookie 无法续签有效的 serviceToken")
 		}
-		return nil, &httpStatusError{code: res.StatusCode(), status: res.Status()}
+		return &httpStatusError{code: res.StatusCode(), status: res.Status()}
 	}
 
 	d.updateSessionFromResponse(res)
 	body := res.Body()
+	var errResp errorResponse
+	if err = json.Unmarshal(body, &errResp); err != nil {
+		return fmt.Errorf("解析响应失败: %w", err)
+	}
+	if errResp.Code != 0 {
+		return &apiError{
+			code:        errResp.Code,
+			description: errResp.description(),
+			retriable:   errResp.Retriable,
+		}
+	}
 	if resp != nil {
 		if err = json.Unmarshal(body, resp); err != nil {
-			return body, fmt.Errorf("解析响应失败: %w", err)
-		}
-		var errResp ErrorResp
-		if err = json.Unmarshal(body, &errResp); err == nil && errResp.Code != 0 && errResp.Result != "ok" {
-			return body, &apiError{
-				code:        errResp.Code,
-				description: errResp.Description,
-				retriable:   errResp.Retriable,
-			}
+			return fmt.Errorf("解析响应失败: %w", err)
 		}
 	}
 
 	log.Debugf("[xiaomi_cloud] 请求成功: %s %s", method, rawURL)
-	return body, nil
+	return nil
 }
 
 func (d *XiaomiCloud) doRequest(ctx context.Context, rawURL, method string, callback requestCallback) (*resty.Response, sessionCookies, error) {
 	req := base.RestyClient.R().SetContext(ctx)
 	session := d.sessionSnapshot()
 	req.SetHeaders(map[string]string{
-		"User-Agent":      UserAgent,
-		"Referer":         Referer,
+		"User-Agent":      userAgent,
+		"Referer":         referer,
 		"Accept":          "*/*",
 		"Accept-Language": "zh-CN,zh;q=0.9",
 	})
@@ -120,14 +123,6 @@ func (d *XiaomiCloud) doRequest(ctx context.Context, rawURL, method string, call
 	}
 	res, err := req.Execute(method, rawURL)
 	return res, session, err
-}
-
-func buildFormData(data map[string]string) string {
-	values := url.Values{}
-	for key, value := range data {
-		values.Set(key, value)
-	}
-	return values.Encode()
 }
 
 func isXiaomiAPIURL(rawURL string) bool {
@@ -174,35 +169,28 @@ func isRetriableError(err error) bool {
 		return true
 	}
 	errText := strings.ToLower(err.Error())
-	return strings.Contains(errText, "http错误: 502") ||
-		strings.Contains(errText, "http错误: 503") ||
-		strings.Contains(errText, "http错误: 504") ||
-		strings.Contains(errText, "connection reset")
+	return strings.Contains(errText, "connection reset")
 }
 
 func normalizeError(err error) error {
 	if err == nil {
 		return nil
 	}
+	statusCode := 0
 	var apiErr *apiError
 	if errors.As(err, &apiErr) {
-		switch apiErr.code {
-		case http.StatusUnauthorized:
-			return errs.NewErr(errs.EmptyToken, "account_cookie 已失效或需要重新提取")
-		case http.StatusForbidden:
-			return fmt.Errorf("访问被拒绝: %w", err)
-		case http.StatusNotFound:
-			return errs.NewErr(errs.ObjectNotFound, "文件或文件夹不存在")
-		}
+		statusCode = apiErr.code
 	}
-	errMsg := err.Error()
-	if strings.Contains(errMsg, "code=401") || strings.Contains(errMsg, "未授权") {
+	var statusErr *httpStatusError
+	if errors.As(err, &statusErr) {
+		statusCode = statusErr.code
+	}
+	switch statusCode {
+	case http.StatusUnauthorized:
 		return errs.NewErr(errs.EmptyToken, "account_cookie 已失效或需要重新提取")
-	}
-	if strings.Contains(errMsg, "code=403") || strings.Contains(errMsg, "禁止访问") {
+	case http.StatusForbidden:
 		return fmt.Errorf("访问被拒绝: %w", err)
-	}
-	if strings.Contains(errMsg, "code=404") || strings.Contains(errMsg, "不存在") {
+	case http.StatusNotFound:
 		return errs.NewErr(errs.ObjectNotFound, "文件或文件夹不存在")
 	}
 	return err

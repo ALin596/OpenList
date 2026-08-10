@@ -3,6 +3,7 @@ package xiaomi_cloud
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -21,12 +22,9 @@ type XiaomiCloud struct {
 	model.Storage
 	Addition
 
-	sessionMu    sync.RWMutex
-	refreshMu    sync.Mutex
-	serviceToken string
-	userID       string
-	sessionHash  string
-	userHash     string
+	sessionMu sync.RWMutex
+	refreshMu sync.Mutex
+	session   sessionCookies
 }
 
 func (d *XiaomiCloud) Config() driver.Config {
@@ -50,22 +48,20 @@ func (d *XiaomiCloud) Init(ctx context.Context) error {
 	}
 
 	// 验证Cookie有效性
-	apiURL := fmt.Sprintf("%s/user/status", BaseURL)
+	apiURL := fmt.Sprintf("%s/user/status", baseURL)
 	var statusResp struct {
-		Result string `json:"result"`
-		Code   int    `json:"code"`
-		Data   struct {
+		Data struct {
 			Status string `json:"status"`
 		} `json:"data"`
 	}
 
-	_, err := d.request(ctx, apiURL, http.MethodGet, nil, &statusResp)
+	err := d.request(ctx, apiURL, http.MethodGet, nil, &statusResp)
 	if err != nil {
+		var apiErr *apiError
+		if errors.As(err, &apiErr) {
+			return errs.NewErr(errs.EmptyToken, "serviceToken 验证失败，请检查 account_cookie: %v", err)
+		}
 		return normalizeError(err)
-	}
-
-	if statusResp.Code != 0 {
-		return errs.NewErr(errs.EmptyToken, "serviceToken 验证失败，请检查 account_cookie")
 	}
 
 	if statusResp.Data.Status != "NORMAL" {
@@ -76,33 +72,28 @@ func (d *XiaomiCloud) Init(ctx context.Context) error {
 	return nil
 }
 
-func (d *XiaomiCloud) Drop(ctx context.Context) error {
-	// 清理资源(如果有需要)
+func (d *XiaomiCloud) Drop(_ context.Context) error {
 	return nil
 }
 
-func (d *XiaomiCloud) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
+func (d *XiaomiCloud) List(ctx context.Context, dir model.Obj, _ model.ListArgs) ([]model.Obj, error) {
 	files, err := d.getFiles(ctx, dir.GetID())
 	if err != nil {
 		return nil, normalizeError(err)
 	}
 
-	return utils.SliceConvert(files, func(src File) (model.Obj, error) {
+	return utils.SliceConvert(files, func(src file) (model.Obj, error) {
 		return fileToObj(src), nil
 	})
 }
 
-func (d *XiaomiCloud) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
-	apiURL := fmt.Sprintf("%s%s/files/%s", BaseURL, APIPrefix, file.GetID())
+func (d *XiaomiCloud) Link(ctx context.Context, file model.Obj, _ model.LinkArgs) (*model.Link, error) {
+	apiURL := fmt.Sprintf("%s%s/files/%s", baseURL, apiPrefix, file.GetID())
 
-	var resp FileInfoResp
-	_, err := d.request(ctx, apiURL, http.MethodGet, nil, &resp)
+	var resp fileInfoResponse
+	err := d.request(ctx, apiURL, http.MethodGet, nil, &resp)
 	if err != nil {
 		return nil, normalizeError(err)
-	}
-
-	if resp.Code != 0 {
-		return nil, fmt.Errorf("获取下载链接失败: %s", resp.Description)
 	}
 
 	// 检查URL是否过期
@@ -113,31 +104,26 @@ func (d *XiaomiCloud) Link(ctx context.Context, file model.Obj, args model.LinkA
 	return &model.Link{
 		URL: resp.Data.Storage.DownloadURL,
 		Header: http.Header{
-			"Referer":    []string{Referer},
-			"User-Agent": []string{UserAgent},
+			"Referer":    []string{referer},
+			"User-Agent": []string{userAgent},
 		},
 	}, nil
 }
 
 func (d *XiaomiCloud) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {
-	apiURL := fmt.Sprintf("%s%s/folders/create", BaseURL, APIPrefix)
+	apiURL := fmt.Sprintf("%s%s/folders/create", baseURL, apiPrefix)
 
-	var resp CreateFolderResp
-	_, err := d.request(ctx, apiURL, http.MethodPost, func(req *resty.Request, serviceToken string) {
-		req.SetHeader("Content-Type", "application/x-www-form-urlencoded")
-		req.SetBody(buildFormData(map[string]string{
+	var resp createFolderResponse
+	err := d.request(ctx, apiURL, http.MethodPost, func(req *resty.Request, serviceToken string) {
+		req.SetFormData(map[string]string{
 			"name":         dirName,
 			"parentId":     parentDir.GetID(),
 			"serviceToken": serviceToken,
-		}))
+		})
 	}, &resp)
 
 	if err != nil {
 		return normalizeError(err)
-	}
-
-	if resp.Code != 0 {
-		return fmt.Errorf("创建文件夹失败: %s", resp.Description)
 	}
 
 	log.Infof("[xiaomi_cloud] 创建文件夹成功: %s (ID: %s)", dirName, resp.Data.ID)
@@ -145,9 +131,9 @@ func (d *XiaomiCloud) MakeDir(ctx context.Context, parentDir model.Obj, dirName 
 }
 
 func (d *XiaomiCloud) Move(ctx context.Context, srcObj, dstDir model.Obj) error {
-	apiURL := fmt.Sprintf("%s%s/records/filemanager", BaseURL, APIPrefix)
+	apiURL := fmt.Sprintf("%s%s/records/filemanager", baseURL, apiPrefix)
 
-	operateRecords := []FileManagerRecord{
+	operateRecords := []fileManagerRecord{
 		{
 			ID:       srcObj.GetID(),
 			ParentID: dstDir.GetID(),
@@ -159,22 +145,17 @@ func (d *XiaomiCloud) Move(ctx context.Context, srcObj, dstDir model.Obj) error 
 		return fmt.Errorf("构建移动请求失败: %w", err)
 	}
 
-	var resp DeleteResp
-	_, err = d.request(ctx, apiURL, http.MethodPost, func(req *resty.Request, serviceToken string) {
-		req.SetHeader("Content-Type", "application/x-www-form-urlencoded")
-		req.SetBody(buildFormData(map[string]string{
+	var resp fileManagerResponse
+	err = d.request(ctx, apiURL, http.MethodPost, func(req *resty.Request, serviceToken string) {
+		req.SetFormData(map[string]string{
 			"operateType":    "MOVE",
 			"operateRecords": string(operateRecordsJSON),
 			"serviceToken":   serviceToken,
-		}))
+		})
 	}, &resp)
 
 	if err != nil {
 		return normalizeError(err)
-	}
-
-	if resp.Code != 0 {
-		return fmt.Errorf("移动文件失败: %s", resp.Description)
 	}
 
 	if resp.Data.TaskID != "" {
@@ -187,40 +168,34 @@ func (d *XiaomiCloud) Move(ctx context.Context, srcObj, dstDir model.Obj) error 
 }
 
 func (d *XiaomiCloud) Rename(ctx context.Context, srcObj model.Obj, newName string) error {
-	apiURL := fmt.Sprintf("%s%s/records/rename", BaseURL, APIPrefix)
+	apiURL := fmt.Sprintf("%s%s/records/rename", baseURL, apiPrefix)
 
-	var resp RenameResp
-	_, err := d.request(ctx, apiURL, http.MethodPost, func(req *resty.Request, serviceToken string) {
-		req.SetHeader("Content-Type", "application/x-www-form-urlencoded")
-		req.SetBody(buildFormData(map[string]string{
+	err := d.request(ctx, apiURL, http.MethodPost, func(req *resty.Request, serviceToken string) {
+		req.SetFormData(map[string]string{
 			"id":           srcObj.GetID(),
 			"newName":      newName,
 			"channel":      "WEB",
 			"serviceToken": serviceToken,
-		}))
-	}, &resp)
+		})
+	}, nil)
 
 	if err != nil {
 		return normalizeError(err)
 	}
 
-	if resp.Code != 0 {
-		return fmt.Errorf("重命名失败: %s", resp.Description)
-	}
-
 	return nil
 }
 
-func (d *XiaomiCloud) Copy(ctx context.Context, srcObj, dstDir model.Obj) error {
+func (d *XiaomiCloud) Copy(_ context.Context, _, _ model.Obj) error {
 	// 小米云盘没有直接的复制接口,需要通过下载再上传实现
 	return errs.NewErr(errs.NotImplement, "小米云盘暂不支持复制操作")
 }
 
 func (d *XiaomiCloud) Remove(ctx context.Context, obj model.Obj) error {
-	apiURL := fmt.Sprintf("%s%s/records/filemanager", BaseURL, APIPrefix)
+	apiURL := fmt.Sprintf("%s%s/records/filemanager", baseURL, apiPrefix)
 
 	// 构建操作记录
-	operateRecords := []FileManagerRecord{
+	operateRecords := []fileManagerRecord{
 		{
 			ID:   obj.GetID(),
 			Type: getFileManagerRecordType(obj),
@@ -232,22 +207,17 @@ func (d *XiaomiCloud) Remove(ctx context.Context, obj model.Obj) error {
 		return fmt.Errorf("构建删除请求失败: %w", err)
 	}
 
-	var resp DeleteResp
-	_, err = d.request(ctx, apiURL, http.MethodPost, func(req *resty.Request, serviceToken string) {
-		req.SetHeader("Content-Type", "application/x-www-form-urlencoded")
-		req.SetBody(buildFormData(map[string]string{
+	var resp fileManagerResponse
+	err = d.request(ctx, apiURL, http.MethodPost, func(req *resty.Request, serviceToken string) {
+		req.SetFormData(map[string]string{
 			"operateType":    "DELETE",
 			"operateRecords": string(operateRecordsJSON),
 			"serviceToken":   serviceToken,
-		}))
+		})
 	}, &resp)
 
 	if err != nil {
 		return normalizeError(err)
-	}
-
-	if resp.Code != 0 {
-		return fmt.Errorf("删除失败: %s", resp.Description)
 	}
 
 	// 等待异步任务完成
@@ -263,16 +233,12 @@ func (d *XiaomiCloud) Remove(ctx context.Context, obj model.Obj) error {
 }
 
 func (d *XiaomiCloud) GetDetails(ctx context.Context) (*model.StorageDetails, error) {
-	apiURL := fmt.Sprintf("%s/status/alldetail", BaseURL)
+	apiURL := fmt.Sprintf("%s/status/alldetail", baseURL)
 
-	var resp StorageInfoResp
-	_, err := d.request(ctx, apiURL, http.MethodGet, nil, &resp)
+	var resp storageInfoResponse
+	err := d.request(ctx, apiURL, http.MethodGet, nil, &resp)
 	if err != nil {
 		return nil, normalizeError(err)
-	}
-
-	if resp.Code != 0 {
-		return nil, fmt.Errorf("获取存储空间失败: %s", resp.Description)
 	}
 
 	return &model.StorageDetails{

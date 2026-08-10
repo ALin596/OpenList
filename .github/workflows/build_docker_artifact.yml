@@ -1,0 +1,163 @@
+name: Build Docker Image Artifact (amd64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Branch, tag, or commit to build (empty uses the selected workflow branch)
+        required: false
+        type: string
+      image_tag:
+        description: Tag stored inside the Docker archive
+        required: true
+        default: openlist-local:custom
+        type: string
+      variant:
+        description: Optional tools included in the image
+        required: true
+        default: base
+        type: choice
+        options:
+          - base
+          - ffmpeg
+          - aria2
+          - aio
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build linux/amd64 image archive
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve image variant
+        id: variant
+        shell: bash
+        env:
+          VARIANT: ${{ inputs.variant }}
+        run: |
+          case "$VARIANT" in
+            base)
+              base_image_tag=base
+              install_ffmpeg=false
+              install_aria2=false
+              ;;
+            ffmpeg)
+              base_image_tag=ffmpeg
+              install_ffmpeg=true
+              install_aria2=false
+              ;;
+            aria2)
+              base_image_tag=aria2
+              install_ffmpeg=false
+              install_aria2=true
+              ;;
+            aio)
+              base_image_tag=aio
+              install_ffmpeg=true
+              install_aria2=true
+              ;;
+            *)
+              echo "Unsupported image variant: $VARIANT" >&2
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "base_image_tag=$base_image_tag"
+            echo "install_ffmpeg=$install_ffmpeg"
+            echo "install_aria2=$install_aria2"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Build and export image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: false
+          tags: ${{ inputs.image_tag }}
+          build-args: |
+            BASE_IMAGE_TAG=${{ steps.variant.outputs.base_image_tag }}
+            INSTALL_FFMPEG=${{ steps.variant.outputs.install_ffmpeg }}
+            INSTALL_ARIA2=${{ steps.variant.outputs.install_aria2 }}
+          outputs: type=docker,dest=${{ runner.temp }}/openlist-linux-amd64.tar
+          cache-from: type=gha,scope=openlist-linux-amd64-${{ inputs.variant }}
+          cache-to: type=gha,mode=max,scope=openlist-linux-amd64-${{ inputs.variant }}
+          provenance: false
+          sbom: false
+
+      - name: Verify image archive
+        shell: bash
+        env:
+          IMAGE_ARCHIVE: ${{ runner.temp }}/openlist-linux-amd64.tar
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          docker load --input "$IMAGE_ARCHIVE"
+          docker image inspect "$IMAGE_TAG" >/dev/null
+          docker run --rm --platform linux/amd64 "$IMAGE_TAG" version
+
+      - name: Write image information
+        shell: bash
+        env:
+          IMAGE_ARCHIVE: ${{ runner.temp }}/openlist-linux-amd64.tar
+          IMAGE_INFO: ${{ runner.temp }}/image-info.txt
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          VARIANT: ${{ inputs.variant }}
+        run: |
+          source_ref=$(git describe --tags --always --dirty)
+          commit=$(git rev-parse HEAD)
+          image_id=$(docker image inspect --format '{{.Id}}' "$IMAGE_TAG")
+          archive_sha256=$(sha256sum "$IMAGE_ARCHIVE" | cut -d ' ' -f 1)
+          archive_size=$(du -h "$IMAGE_ARCHIVE" | cut -f 1)
+
+          {
+            echo "Source: $source_ref"
+            echo "Commit: $commit"
+            echo "Platform: linux/amd64"
+            echo "Variant: $VARIANT"
+            echo "Image tag: $IMAGE_TAG"
+            echo "Image ID: $image_id"
+            echo "Archive size: $archive_size"
+            echo "Archive SHA256: $archive_sha256"
+          } | tee "$IMAGE_INFO"
+
+          {
+            echo "## Docker image artifact"
+            echo
+            echo '```text'
+            cat "$IMAGE_INFO"
+            echo '```'
+            echo
+            echo 'Load it on Linux with:'
+            echo '```bash'
+            echo 'docker load --input openlist-linux-amd64.tar'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: openlist-docker-linux-amd64
+          path: |
+            ${{ runner.temp }}/openlist-linux-amd64.tar
+            ${{ runner.temp }}/image-info.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7

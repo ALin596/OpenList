@@ -406,7 +406,7 @@ func TestRequestHonorsCanceledContext(t *testing.T) {
 	}
 }
 
-func TestUploadBlockRetryRestartsSectionReader(t *testing.T) {
+func TestUploadBlockRetryRestartsSectionReaderAfterClientTimeout(t *testing.T) {
 	data := []byte("retry-block")
 	var attempts atomic.Int32
 	previousClient := base.RestyClient
@@ -419,7 +419,11 @@ func TestUploadBlockRetryRestartsSectionReader(t *testing.T) {
 			return nil, fmt.Errorf("retry body = %q, want %q", body, data)
 		}
 		if attempts.Add(1) == 1 {
-			return testResponse(req, http.StatusServiceUnavailable, "unavailable", nil), nil
+			return nil, &url.Error{
+				Op:  req.Method,
+				URL: req.URL.String(),
+				Err: context.DeadlineExceeded,
+			}
 		}
 		return testResponse(req, http.StatusOK, `{"commit_meta":"commit-0","stat":"BLOCK_COMPLETED"}`, nil), nil
 	}))

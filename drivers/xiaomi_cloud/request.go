@@ -141,7 +141,9 @@ func retryRequest(ctx context.Context, attempts int, fn func() error) error {
 		retry.Attempts(uint(attempts)),
 		retry.Delay(time.Second),
 		retry.DelayType(retry.BackOffDelay),
-		retry.RetryIf(isRetriableError),
+		retry.RetryIf(func(err error) bool {
+			return isRetriableError(ctx, err)
+		}),
 		retry.LastErrorOnly(true),
 		retry.OnRetry(func(attempt uint, err error) {
 			log.Warnf("[xiaomi_cloud] 请求失败,准备第 %d 次重试: %v", attempt+1, err)
@@ -149,9 +151,13 @@ func retryRequest(ctx context.Context, attempts int, fn func() error) error {
 	)
 }
 
-func isRetriableError(err error) bool {
-	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+func isRetriableError(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil || errors.Is(err, context.Canceled) {
 		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		var urlErr *url.Error
+		return errors.As(err, &urlErr) && urlErr.Timeout()
 	}
 	var statusErr *httpStatusError
 	if errors.As(err, &statusErr) {

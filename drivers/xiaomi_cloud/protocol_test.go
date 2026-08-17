@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
@@ -59,24 +60,35 @@ func TestRequestValidatesJSONWithoutResponseTarget(t *testing.T) {
 }
 
 func TestIsRetriableError(t *testing.T) {
+	expiredCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	clientTimeout := &url.Error{
+		Op:  http.MethodPost,
+		URL: "https://upload.example.test/node",
+		Err: context.DeadlineExceeded,
+	}
 	tests := []struct {
 		name string
+		ctx  context.Context
 		err  error
 		want bool
 	}{
-		{name: "gateway timeout", err: &httpStatusError{code: http.StatusGatewayTimeout}, want: true},
-		{name: "bad gateway", err: &httpStatusError{code: http.StatusBadGateway}, want: true},
-		{name: "service unavailable", err: &httpStatusError{code: http.StatusServiceUnavailable}, want: true},
-		{name: "connection reset", err: errors.New("connection reset by peer"), want: true},
-		{name: "retriable api error", err: &apiError{code: 1, retriable: true}, want: true},
-		{name: "non-retriable api error", err: &apiError{code: 1}, want: false},
-		{name: "canceled", err: context.Canceled, want: false},
-		{name: "unauthorized", err: &httpStatusError{code: http.StatusUnauthorized}, want: false},
+		{name: "gateway timeout", ctx: context.Background(), err: &httpStatusError{code: http.StatusGatewayTimeout}, want: true},
+		{name: "bad gateway", ctx: context.Background(), err: &httpStatusError{code: http.StatusBadGateway}, want: true},
+		{name: "service unavailable", ctx: context.Background(), err: &httpStatusError{code: http.StatusServiceUnavailable}, want: true},
+		{name: "connection reset", ctx: context.Background(), err: errors.New("connection reset by peer"), want: true},
+		{name: "client timeout", ctx: context.Background(), err: clientTimeout, want: true},
+		{name: "request deadline", ctx: expiredCtx, err: clientTimeout, want: false},
+		{name: "raw deadline", ctx: context.Background(), err: context.DeadlineExceeded, want: false},
+		{name: "retriable api error", ctx: context.Background(), err: &apiError{code: 1, retriable: true}, want: true},
+		{name: "non-retriable api error", ctx: context.Background(), err: &apiError{code: 1}, want: false},
+		{name: "canceled", ctx: context.Background(), err: context.Canceled, want: false},
+		{name: "unauthorized", ctx: context.Background(), err: &httpStatusError{code: http.StatusUnauthorized}, want: false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := isRetriableError(tt.err); got != tt.want {
+			if got := isRetriableError(tt.ctx, tt.err); got != tt.want {
 				t.Fatalf("isRetriableError(%q) = %v, want %v", tt.err, got, tt.want)
 			}
 		})

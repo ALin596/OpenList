@@ -150,7 +150,7 @@ func (d *XiaomiCloud) waitForUploadedFile(
 			continue
 		}
 		normalized := normalizeError(err)
-		if !errs.IsObjectNotFound(normalized) && !isRetriableError(err) {
+		if !errs.IsObjectNotFound(normalized) && !isRetriableError(ctx, err) {
 			return file{}, normalized
 		}
 		lastErr = normalized
@@ -280,7 +280,9 @@ func (d *XiaomiCloud) uploadBlocks(
 		retry.Attempts(uploadAttempts),
 		retry.Delay(time.Second),
 		retry.DelayType(retry.BackOffDelay),
-		retry.RetryIf(isRetriableError),
+		retry.RetryIf(func(err error) bool {
+			return isRetriableError(ctx, err)
+		}),
 		retry.LastErrorOnly(true),
 	)
 	commitMetas := make([]commitMeta, blockCount)

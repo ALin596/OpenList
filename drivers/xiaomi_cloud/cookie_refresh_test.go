@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync"
@@ -93,6 +94,45 @@ func TestEnsureServiceTokenFromAccountCookie(t *testing.T) {
 	}
 	if !hasCookie(driver.AccountCookie, "passToken") || !strings.Contains(driver.AccountCookie, "renewed-pass") {
 		t.Fatalf("account cookie was not refreshed: %s", driver.AccountCookie)
+	}
+	if serviceLoginCount.Load() != 1 {
+		t.Fatalf("serviceLogin count = %d, want 1", serviceLoginCount.Load())
+	}
+}
+
+func TestDropClearsSessionAndForcesRefresh(t *testing.T) {
+	var serviceLoginCount atomic.Int32
+	installAuthFlow(t, &serviceLoginCount)
+
+	driver := &XiaomiCloud{Addition: Addition{AccountCookie: "passToken=account-pass; userId=123456"}}
+	setTestSession(driver, sessionCookies{serviceToken: "old-service", userID: "123456", sessionHash: "old-session", userHash: "old-user"})
+	driver.rememberRecentFile("0", file{ID: "old-file", ParentID: flexibleID("0"), Name: "old.bin", Type: "other"})
+
+	if err := driver.Drop(context.Background()); err != nil {
+		t.Fatalf("Drop() error = %v", err)
+	}
+
+	header := make(http.Header)
+	header.Add("Set-Cookie", "serviceToken=stale-service; Domain=.i.mi.com; Path=/; Secure")
+	staleResponse := &resty.Response{RawResponse: testResponse(
+		httptest.NewRequest(http.MethodGet, baseURL, nil), http.StatusOK, "{}", header,
+	)}
+	driver.updateSessionFromResponse(staleResponse, "old-service")
+	if session := driver.sessionSnapshot(); session != (sessionCookies{}) {
+		t.Fatalf("session after Drop() = %+v", session)
+	}
+	driver.recentFileMu.Lock()
+	recentCount := len(driver.recentFiles)
+	driver.recentFileMu.Unlock()
+	if recentCount != 0 {
+		t.Fatalf("recent file parents after Drop() = %d", recentCount)
+	}
+
+	if err := driver.ensureServiceToken(context.Background(), ""); err != nil {
+		t.Fatalf("ensureServiceToken() after Drop error = %v", err)
+	}
+	if session := driver.sessionSnapshot(); session.serviceToken != "new-service" {
+		t.Fatalf("refreshed service token = %q", session.serviceToken)
 	}
 	if serviceLoginCount.Load() != 1 {
 		t.Fatalf("serviceLogin count = %d, want 1", serviceLoginCount.Load())

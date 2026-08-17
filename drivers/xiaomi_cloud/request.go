@@ -64,7 +64,7 @@ func (d *XiaomiCloud) request(ctx context.Context, rawURL, method string, callba
 		if err = d.ensureServiceToken(ctx, usedSession.serviceToken); err != nil {
 			return err
 		}
-		res, _, err = d.doRequest(ctx, rawURL, method, callback)
+		res, usedSession, err = d.doRequest(ctx, rawURL, method, callback)
 		if err != nil {
 			return err
 		}
@@ -77,7 +77,9 @@ func (d *XiaomiCloud) request(ctx context.Context, rawURL, method string, callba
 		return &httpStatusError{code: res.StatusCode(), status: res.Status()}
 	}
 
-	d.updateSessionFromResponse(res)
+	if isXiaomiAPIURL(rawURL) {
+		d.updateSessionFromResponse(res, usedSession.serviceToken)
+	}
 	body := res.Body()
 	var errResp errorResponse
 	if err = json.Unmarshal(body, &errResp); err != nil {

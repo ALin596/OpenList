@@ -75,6 +75,16 @@ func (d *XiaomiCloud) Init(ctx context.Context) error {
 }
 
 func (d *XiaomiCloud) Drop(_ context.Context) error {
+	d.refreshMu.Lock()
+	defer d.refreshMu.Unlock()
+
+	d.sessionMu.Lock()
+	d.session = sessionCookies{}
+	d.sessionMu.Unlock()
+
+	d.recentFileMu.Lock()
+	d.recentFiles = nil
+	d.recentFileMu.Unlock()
 	return nil
 }
 

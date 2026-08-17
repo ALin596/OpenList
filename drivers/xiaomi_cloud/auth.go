@@ -35,10 +35,13 @@ func (d *XiaomiCloud) sessionSnapshot() sessionCookies {
 	return d.session
 }
 
-func (d *XiaomiCloud) updateSessionFromResponse(res *resty.Response) {
+func (d *XiaomiCloud) updateSessionFromResponse(res *resty.Response, expectedServiceToken string) {
 	d.sessionMu.Lock()
+	defer d.sessionMu.Unlock()
+	if d.session.serviceToken != expectedServiceToken {
+		return
+	}
 	d.session.apply(res.Cookies())
-	d.sessionMu.Unlock()
 }
 
 func (d *XiaomiCloud) ensureServiceToken(ctx context.Context, staleToken string) error {

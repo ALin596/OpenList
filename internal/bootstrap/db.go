@@ -28,6 +28,7 @@ func InitDB() {
 			SlowThreshold:             time.Second,
 			LogLevel:                  logLevel,
 			IgnoreRecordNotFoundError: true,
+			ParameterizedQueries:      true,
 			Colorful:                  true,
 		},
 	)

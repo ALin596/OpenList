@@ -14,14 +14,15 @@ type Addition struct {
 }
 
 var config = driver.Config{
-	Name:        "XiaomiCloud",
-	LocalSort:   false,
-	OnlyProxy:   false,
-	NoCache:     false,
-	NoUpload:    false,
-	NeedMs:      false,
-	DefaultRoot: "0",
-	CheckStatus: false,
+	Name:              "XiaomiCloud",
+	LocalSort:         false,
+	OnlyProxy:         false,
+	NoCache:           false,
+	NoUpload:          false,
+	NeedMs:            false,
+	DefaultRoot:       "0",
+	CheckStatus:       false,
+	NoOverwriteUpload: true,
 	Alert: `info|小米云盘存储驱动
 
 配置方式：

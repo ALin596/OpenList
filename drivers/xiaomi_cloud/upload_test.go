@@ -53,6 +53,12 @@ func TestUploadHasherBuildsOrderedBlockManifest(t *testing.T) {
 	}
 }
 
+func TestConfigUsesRenameSwapForOverwrite(t *testing.T) {
+	if !(&XiaomiCloud{}).Config().NoOverwriteUpload {
+		t.Fatal("XiaomiCloud must use OpenList's rename-swap overwrite flow")
+	}
+}
+
 func TestPutUploadsBlocksConcurrentlyAndCommitsInOrder(t *testing.T) {
 	data := make([]byte, 2*chunkSize+321)
 	for index := range data {

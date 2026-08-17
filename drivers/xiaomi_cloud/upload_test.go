@@ -22,6 +22,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	streamPkg "github.com/OpenListTeam/OpenList/v4/internal/stream"
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/go-resty/resty/v2"
 )
 
@@ -276,6 +277,86 @@ func TestPutRapidUploadReturnsFileInfo(t *testing.T) {
 	obj, err := driver.Put(context.Background(), &model.Object{ID: "rapid-parent", IsFolder: true}, stream, func(float64) {})
 	if err != nil || obj.GetID() != "rapid-file" {
 		t.Fatalf("Put() = %+v, %v", obj, err)
+	}
+}
+
+func TestPutReturnsCommittedObjectWhenMetadataStaysMissing(t *testing.T) {
+	setUploadVisibilityDelays(t, []time.Duration{0, 0})
+	data := []byte("committed-upload")
+	fileSHA1 := hashHex(sha1.New(), data)
+	previousClient := base.RestyClient
+	base.RestyClient = resty.New().SetRetryCount(0).SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case apiPrefix + "/files/create":
+			return testResponse(req, http.StatusOK, `{
+				"result":"ok","code":0,"data":{
+					"uploadId":"upload-committed","exists":false,
+					"kss":{"file_meta":"file-meta","node_urls":["https://upload.example.test/node"],
+					"block_metas":[{"block_meta":"block-0"}]}
+				}
+			}`, nil), nil
+		case "/node/upload_block_chunk":
+			return testResponse(req, http.StatusOK, `{"commit_meta":"commit-0","stat":"BLOCK_COMPLETED"}`, nil), nil
+		case apiPrefix + "/files/commit":
+			return testResponse(req, http.StatusOK, `{"result":"ok","code":0,"data":{"id":"file-committed"}}`, nil), nil
+		case apiPrefix + "/files/file-committed":
+			return testResponse(req, http.StatusNotFound, `{"code":404,"description":"not found"}`, nil), nil
+		case apiPrefix + "/folders/children":
+			return testResponse(req, http.StatusOK, `{"result":"ok","code":0,"data":{"records":[],"hasMore":false}}`, nil), nil
+		default:
+			return nil, fmt.Errorf("unexpected request: %s", req.URL)
+		}
+	}))
+	t.Cleanup(func() {
+		base.RestyClient = previousClient
+	})
+
+	driver := &XiaomiCloud{Addition: Addition{UploadThread: 1}}
+	setTestSession(driver, sessionCookies{serviceToken: "service", userID: "user", sessionHash: "session", userHash: "hash"})
+	stream := &streamPkg.FileStream{
+		Obj:      &model.Object{Name: "committed.bin", Size: int64(len(data))},
+		Reader:   bytes.NewReader(data),
+		Mimetype: "application/octet-stream",
+	}
+	parent := &model.Object{ID: "parent-committed", IsFolder: true}
+	obj, err := driver.Put(context.Background(), parent, stream, func(float64) {})
+	if err != nil {
+		t.Fatalf("Put() error = %v", err)
+	}
+	if obj.GetID() != "file-committed" || obj.GetName() != "committed.bin" || obj.GetSize() != int64(len(data)) || obj.GetHash().GetHash(utils.SHA1) != fileSHA1 {
+		t.Fatalf("Put() committed object = id:%q name:%q size:%d hash:%q", obj.GetID(), obj.GetName(), obj.GetSize(), obj.GetHash().GetHash(utils.SHA1))
+	}
+
+	files, err := driver.List(context.Background(), parent, model.ListArgs{})
+	if err != nil || len(files) != 1 || files[0].GetID() != "file-committed" {
+		t.Fatalf("List() after committed fallback = %+v, %v", files, err)
+	}
+}
+
+func TestWaitForUploadedFileReturnsValidationError(t *testing.T) {
+	setUploadVisibilityDelays(t, []time.Duration{0})
+	previousClient := base.RestyClient
+	base.RestyClient = resty.New().SetRetryCount(0).SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return testResponse(req, http.StatusOK, `{
+			"result":"ok","code":0,"data":{
+				"id":"file-mismatch","parentId":"parent","name":"name.bin","type":"other",
+				"size":4,"createTime":1,"modifyTime":2,"sha1":"wrong"
+			}
+		}`, nil), nil
+	}))
+	t.Cleanup(func() {
+		base.RestyClient = previousClient
+	})
+
+	driver := &XiaomiCloud{}
+	setTestSession(driver, sessionCookies{serviceToken: "service", userID: "user", sessionHash: "session", userHash: "hash"})
+	_, err := driver.waitForUploadedFile(context.Background(), "file-mismatch", "parent", "name.bin", uploadManifest{
+		fileSize: 4,
+		fileSHA1: "expected",
+	})
+	var validationErr *uploadedFileValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("waitForUploadedFile() error = %v, want uploadedFileValidationError", err)
 	}
 }
 

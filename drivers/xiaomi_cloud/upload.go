@@ -6,6 +6,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -56,6 +57,18 @@ type uploadSession struct {
 	blockMetas []uploadBlockMeta
 }
 
+type uploadedFileValidationError struct {
+	err error
+}
+
+func (e *uploadedFileValidationError) Error() string {
+	return fmt.Sprintf("上传文件元数据校验失败: %v", e.err)
+}
+
+func (e *uploadedFileValidationError) Unwrap() error {
+	return e.err
+}
+
 func (d *XiaomiCloud) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) (model.Obj, error) {
 	cache, manifest, uploadProgress, err := prepareUpload(stream, up)
 	if err != nil {
@@ -89,7 +102,13 @@ func (d *XiaomiCloud) Put(ctx context.Context, dstDir model.Obj, stream model.Fi
 
 	uploaded, err := d.waitForUploadedFile(ctx, fileID, dstDir.GetID(), stream.GetName(), manifest)
 	if err != nil {
-		return nil, err
+		var validationErr *uploadedFileValidationError
+		if errors.As(err, &validationErr) {
+			return nil, err
+		}
+		uploaded = newCommittedFile(fileID, dstDir.GetID(), stream.GetName(), stream.GetMimetype(), manifest)
+		log.Warnf("[xiaomi_cloud] 上传已提交但文件元数据暂不可读,使用提交结果继续: %s (ID: %s): %v",
+			stream.GetName(), fileID, err)
 	}
 	d.rememberRecentFile(dstDir.GetID(), uploaded)
 	log.Infof("[xiaomi_cloud] 文件上传成功: %s (ID: %s)", stream.GetName(), uploaded.ID)
@@ -106,12 +125,16 @@ func (d *XiaomiCloud) waitForUploadedFile(
 		return file{}, fmt.Errorf("上传响应缺少文件ID")
 	}
 	var lastErr error
+	var validationErr error
 	for _, delay := range uploadVisibilityDelays {
 		if delay > 0 {
 			timer := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
+				if validationErr != nil {
+					return file{}, &uploadedFileValidationError{err: validationErr}
+				}
 				return file{}, ctx.Err()
 			case <-timer.C:
 			}
@@ -122,6 +145,7 @@ func (d *XiaomiCloud) waitForUploadedFile(
 			if err = validateUploadedFile(uploaded, fileID, parentID, name, manifest.fileSize, manifest.fileSHA1); err == nil {
 				return uploaded, nil
 			}
+			validationErr = err
 			lastErr = err
 			continue
 		}
@@ -131,7 +155,28 @@ func (d *XiaomiCloud) waitForUploadedFile(
 		}
 		lastErr = normalized
 	}
+	if validationErr != nil {
+		return file{}, &uploadedFileValidationError{err: validationErr}
+	}
 	return file{}, fmt.Errorf("上传已提交但文件元数据仍不可读: id=%s: %v", fileID, lastErr)
+}
+
+func newCommittedFile(fileID, parentID, name, mimeType string, manifest uploadManifest) file {
+	now := time.Now().UnixMilli()
+	fileType := "other"
+	if strings.HasPrefix(mimeType, "image/") {
+		fileType = "pic"
+	}
+	return file{
+		ID:         fileID,
+		ParentID:   flexibleID(parentID),
+		Name:       name,
+		Type:       fileType,
+		Size:       manifest.fileSize,
+		CreateTime: now,
+		ModifyTime: now,
+		SHA1:       manifest.fileSHA1,
+	}
 }
 
 func prepareUpload(stream model.FileStreamer, up driver.UpdateProgress) (model.File, uploadManifest, driver.UpdateProgress, error) {

@@ -189,6 +189,16 @@ func TestCreateUploadResponseUnmarshalRapidUpload(t *testing.T) {
 	}
 }
 
+func TestFileInfoResponseUnmarshalNumericParentID(t *testing.T) {
+	var resp fileInfoResponse
+	if err := json.Unmarshal([]byte(`{"data":{"id":"file-1","parentId":0,"name":"root-file"}}`), &resp); err != nil {
+		t.Fatalf("unmarshal file info response: %v", err)
+	}
+	if resp.Data.ID != "file-1" || string(resp.Data.ParentID) != "0" {
+		t.Fatalf("file info response = %+v", resp.Data)
+	}
+}
+
 func TestBuildKSSUploadURL(t *testing.T) {
 	uploadURL := buildKSSUploadURL("https://upload.example.test/node/", "file meta", "block+meta")
 	parsed, err := url.Parse(uploadURL)

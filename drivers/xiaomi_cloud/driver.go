@@ -22,9 +22,11 @@ type XiaomiCloud struct {
 	model.Storage
 	Addition
 
-	sessionMu sync.RWMutex
-	refreshMu sync.Mutex
-	session   sessionCookies
+	sessionMu    sync.RWMutex
+	refreshMu    sync.Mutex
+	recentFileMu sync.Mutex
+	session      sessionCookies
+	recentFiles  map[string]map[string]recentFile
 }
 
 func (d *XiaomiCloud) Config() driver.Config {
@@ -81,6 +83,7 @@ func (d *XiaomiCloud) List(ctx context.Context, dir model.Obj, _ model.ListArgs)
 	if err != nil {
 		return nil, normalizeError(err)
 	}
+	files = d.mergeRecentFiles(dir.GetID(), files)
 
 	return utils.SliceConvert(files, func(src file) (model.Obj, error) {
 		return fileToObj(src), nil
@@ -88,21 +91,18 @@ func (d *XiaomiCloud) List(ctx context.Context, dir model.Obj, _ model.ListArgs)
 }
 
 func (d *XiaomiCloud) Link(ctx context.Context, file model.Obj, _ model.LinkArgs) (*model.Link, error) {
-	apiURL := fmt.Sprintf("%s%s/files/%s", baseURL, apiPrefix, file.GetID())
-
-	var resp fileInfoResponse
-	err := d.request(ctx, apiURL, http.MethodGet, nil, &resp)
+	fileInfo, err := d.getFile(ctx, file.GetID())
 	if err != nil {
 		return nil, normalizeError(err)
 	}
 
 	// 检查URL是否过期
-	if resp.Data.Storage.ExpireAt < time.Now().UnixMilli() {
+	if fileInfo.Storage.ExpireAt < time.Now().UnixMilli() {
 		return nil, fmt.Errorf("下载链接已过期,请重试")
 	}
 
 	return &model.Link{
-		URL: resp.Data.Storage.DownloadURL,
+		URL: fileInfo.Storage.DownloadURL,
 		Header: http.Header{
 			"Referer":    []string{referer},
 			"User-Agent": []string{userAgent},
@@ -163,6 +163,7 @@ func (d *XiaomiCloud) Move(ctx context.Context, srcObj, dstDir model.Obj) error 
 			return fmt.Errorf("移动任务失败: %w", err)
 		}
 	}
+	d.moveRecentFile(srcObj.GetID(), dstDir.GetID())
 
 	return nil
 }
@@ -182,6 +183,7 @@ func (d *XiaomiCloud) Rename(ctx context.Context, srcObj model.Obj, newName stri
 	if err != nil {
 		return normalizeError(err)
 	}
+	d.renameRecentFile(srcObj.GetID(), newName)
 
 	return nil
 }
@@ -228,6 +230,7 @@ func (d *XiaomiCloud) Remove(ctx context.Context, obj model.Obj) error {
 			return fmt.Errorf("删除任务失败: %w", err)
 		}
 	}
+	d.forgetRecentFile(obj.GetID())
 
 	return nil
 }
@@ -250,6 +253,7 @@ func (d *XiaomiCloud) GetDetails(ctx context.Context) (*model.StorageDetails, er
 }
 
 var _ driver.Driver = (*XiaomiCloud)(nil)
+var _ driver.PutResult = (*XiaomiCloud)(nil)
 
 func getFileManagerRecordType(obj model.Obj) string {
 	if obj.IsDir() {

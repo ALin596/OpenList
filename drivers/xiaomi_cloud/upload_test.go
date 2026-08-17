@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -114,6 +115,13 @@ func TestPutUploadsBlocksConcurrentlyAndCommitsInOrder(t *testing.T) {
 			committed = metas
 			commitMu.Unlock()
 			return testResponse(req, http.StatusOK, `{"result":"ok","code":0,"data":{"id":"file-1"}}`, nil), nil
+		case apiPrefix + "/files/file-1":
+			return testResponse(req, http.StatusOK, fmt.Sprintf(`{
+				"result":"ok","code":0,"data":{
+					"id":"file-1","parentId":"parent-1","name":"large.bin","type":"other",
+					"size":%d,"createTime":1,"modifyTime":2,"sha1":"%s"
+				}
+			}`, len(data), hashHex(sha1.New(), data)), nil), nil
 		default:
 			return nil, fmt.Errorf("unexpected request: %s", req.URL)
 		}
@@ -129,8 +137,12 @@ func TestPutUploadsBlocksConcurrentlyAndCommitsInOrder(t *testing.T) {
 		Reader:   bytes.NewReader(data),
 		Mimetype: "application/octet-stream",
 	}
-	if err := driver.Put(context.Background(), &model.Object{ID: "parent-1", IsFolder: true}, stream, func(float64) {}); err != nil {
+	obj, err := driver.Put(context.Background(), &model.Object{ID: "parent-1", IsFolder: true}, stream, func(float64) {})
+	if err != nil {
 		t.Fatalf("Put() error = %v", err)
+	}
+	if obj.GetID() != "file-1" || obj.GetName() != "large.bin" || obj.GetSize() != int64(len(data)) {
+		t.Fatalf("Put() object = id:%q name:%q size:%d", obj.GetID(), obj.GetName(), obj.GetSize())
 	}
 	if maxActive.Load() < 2 {
 		t.Fatalf("max concurrent uploads = %d, want at least 2", maxActive.Load())
@@ -145,6 +157,152 @@ func TestPutUploadsBlocksConcurrentlyAndCommitsInOrder(t *testing.T) {
 		if meta.CommitMeta != fmt.Sprintf("commit-%d", index) {
 			t.Fatalf("commit meta %d = %q", index, meta.CommitMeta)
 		}
+	}
+}
+
+func TestPutBridgesDirectoryVisibilityDelay(t *testing.T) {
+	setUploadVisibilityDelays(t, []time.Duration{0, time.Millisecond})
+	data := []byte("read-after-write")
+	fileSHA1 := hashHex(sha1.New(), data)
+	var fileInfoCalls atomic.Int32
+	var listCalls atomic.Int32
+	previousClient := base.RestyClient
+	base.RestyClient = resty.New().SetRetryCount(0).SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case apiPrefix + "/files/create":
+			return testResponse(req, http.StatusOK, `{
+				"result":"ok","code":0,"data":{
+					"uploadId":"upload-visible","exists":false,
+					"kss":{"file_meta":"file-meta","node_urls":["https://upload.example.test/node"],
+					"block_metas":[{"block_meta":"block-0"}]}
+				}
+			}`, nil), nil
+		case "/node/upload_block_chunk":
+			return testResponse(req, http.StatusOK, `{"commit_meta":"commit-0","stat":"BLOCK_COMPLETED"}`, nil), nil
+		case apiPrefix + "/files/commit":
+			return testResponse(req, http.StatusOK, `{"result":"ok","code":0,"data":{"id":"file-visible"}}`, nil), nil
+		case apiPrefix + "/files/file-visible":
+			if fileInfoCalls.Add(1) == 1 {
+				return testResponse(req, http.StatusNotFound, `{"code":404,"description":"not found"}`, nil), nil
+			}
+			return testResponse(req, http.StatusOK, fmt.Sprintf(`{
+				"result":"ok","code":0,"data":{
+					"id":"file-visible","parentId":"parent-visible","name":"visible.bin","type":"other",
+					"size":%d,"createTime":1,"modifyTime":2,"sha1":"%s"
+				}
+			}`, len(data), fileSHA1), nil), nil
+		case apiPrefix + "/folders/children":
+			switch listCalls.Add(1) {
+			case 1:
+				return testResponse(req, http.StatusOK, `{"result":"ok","code":0,"data":{"records":[],"hasMore":false}}`, nil), nil
+			case 2:
+				return testResponse(req, http.StatusOK, fmt.Sprintf(`{
+					"result":"ok","code":0,"data":{"records":[{
+						"id":"file-visible","parentId":"parent-visible","name":"visible.bin","type":"other",
+						"size":%d,"createTime":1,"modifyTime":2,"sha1":"%s"
+					}],"hasMore":false}
+				}`, len(data), fileSHA1), nil), nil
+			default:
+				return testResponse(req, http.StatusOK, `{"result":"ok","code":0,"data":{"records":[],"hasMore":false}}`, nil), nil
+			}
+		default:
+			return nil, fmt.Errorf("unexpected request: %s", req.URL)
+		}
+	}))
+	t.Cleanup(func() {
+		base.RestyClient = previousClient
+	})
+
+	driver := &XiaomiCloud{Addition: Addition{UploadThread: 1}}
+	setTestSession(driver, sessionCookies{serviceToken: "service", userID: "user", sessionHash: "session", userHash: "hash"})
+	stream := &streamPkg.FileStream{
+		Obj:      &model.Object{Name: "visible.bin", Size: int64(len(data))},
+		Reader:   bytes.NewReader(data),
+		Mimetype: "application/octet-stream",
+	}
+	obj, err := driver.Put(context.Background(), &model.Object{ID: "parent-visible", IsFolder: true}, stream, func(float64) {})
+	if err != nil {
+		t.Fatalf("Put() error = %v", err)
+	}
+	if obj.GetID() != "file-visible" || fileInfoCalls.Load() != 2 {
+		t.Fatalf("Put() object id = %q, file info calls = %d", obj.GetID(), fileInfoCalls.Load())
+	}
+
+	parent := &model.Object{ID: "parent-visible", IsFolder: true}
+	files, err := driver.List(context.Background(), parent, model.ListArgs{})
+	if err != nil || len(files) != 1 || files[0].GetID() != "file-visible" {
+		t.Fatalf("first List() = %+v, %v", files, err)
+	}
+	files, err = driver.List(context.Background(), parent, model.ListArgs{})
+	if err != nil || len(files) != 1 || files[0].GetID() != "file-visible" {
+		t.Fatalf("second List() = %+v, %v", files, err)
+	}
+	files, err = driver.List(context.Background(), parent, model.ListArgs{})
+	if err != nil || len(files) != 0 {
+		t.Fatalf("third List() = %+v, %v; recent file should be retired", files, err)
+	}
+}
+
+func TestPutRapidUploadReturnsFileInfo(t *testing.T) {
+	data := []byte("rapid-upload")
+	fileSHA1 := hashHex(sha1.New(), data)
+	previousClient := base.RestyClient
+	base.RestyClient = resty.New().SetRetryCount(0).SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case apiPrefix + "/files/create":
+			return testResponse(req, http.StatusOK, `{"result":"ok","code":0,"data":{"exists":true,"id":"rapid-file"}}`, nil), nil
+		case apiPrefix + "/files/rapid-file":
+			return testResponse(req, http.StatusOK, fmt.Sprintf(`{
+				"result":"ok","code":0,"data":{
+					"id":"rapid-file","parentId":"rapid-parent","name":"rapid.bin","type":"other",
+					"size":%d,"createTime":1,"modifyTime":2,"sha1":"%s"
+				}
+			}`, len(data), fileSHA1), nil), nil
+		default:
+			return nil, fmt.Errorf("unexpected request: %s", req.URL)
+		}
+	}))
+	t.Cleanup(func() {
+		base.RestyClient = previousClient
+	})
+
+	driver := &XiaomiCloud{}
+	setTestSession(driver, sessionCookies{serviceToken: "service", userID: "user", sessionHash: "session", userHash: "hash"})
+	stream := &streamPkg.FileStream{
+		Obj:      &model.Object{Name: "rapid.bin", Size: int64(len(data))},
+		Reader:   bytes.NewReader(data),
+		Mimetype: "application/octet-stream",
+	}
+	obj, err := driver.Put(context.Background(), &model.Object{ID: "rapid-parent", IsFolder: true}, stream, func(float64) {})
+	if err != nil || obj.GetID() != "rapid-file" {
+		t.Fatalf("Put() = %+v, %v", obj, err)
+	}
+}
+
+func TestWaitForUploadedFileHonorsCanceledContext(t *testing.T) {
+	setUploadVisibilityDelays(t, []time.Duration{time.Hour})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := (&XiaomiCloud{}).waitForUploadedFile(ctx, "file", "parent", "name", uploadManifest{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitForUploadedFile() error = %v, want context.Canceled", err)
+	}
+}
+
+func TestWaitForUploadedFileTimesOutWhenMetadataStaysMissing(t *testing.T) {
+	setUploadVisibilityDelays(t, []time.Duration{0, 0})
+	previousClient := base.RestyClient
+	base.RestyClient = resty.New().SetRetryCount(0).SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return testResponse(req, http.StatusNotFound, `{"code":404,"description":"not found"}`, nil), nil
+	}))
+	t.Cleanup(func() {
+		base.RestyClient = previousClient
+	})
+	driver := &XiaomiCloud{}
+	setTestSession(driver, sessionCookies{serviceToken: "service", userID: "user", sessionHash: "session", userHash: "hash"})
+	_, err := driver.waitForUploadedFile(context.Background(), "file", "parent", "name", uploadManifest{})
+	if err == nil || !strings.Contains(err.Error(), "文件元数据仍不可读") {
+		t.Fatalf("waitForUploadedFile() error = %v", err)
 	}
 }
 
@@ -227,6 +385,15 @@ func hashHex(hasher interface {
 }, data []byte) string {
 	_, _ = hasher.Write(data)
 	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+func setUploadVisibilityDelays(t *testing.T, delays []time.Duration) {
+	t.Helper()
+	previous := uploadVisibilityDelays
+	uploadVisibilityDelays = delays
+	t.Cleanup(func() {
+		uploadVisibilityDelays = previous
+	})
 }
 
 func readRequestForm(req *http.Request) (url.Values, error) {

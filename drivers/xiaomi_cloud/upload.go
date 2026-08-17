@@ -18,6 +18,7 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/pkg/errgroup"
 	"github.com/avast/retry-go"
@@ -32,6 +33,16 @@ const (
 	uploadAttempts             = 3
 )
 
+var uploadVisibilityDelays = []time.Duration{
+	0,
+	50 * time.Millisecond,
+	100 * time.Millisecond,
+	200 * time.Millisecond,
+	400 * time.Millisecond,
+	800 * time.Millisecond,
+	1600 * time.Millisecond,
+}
+
 type uploadManifest struct {
 	fileSHA1 string
 	fileSize int64
@@ -45,40 +56,82 @@ type uploadSession struct {
 	blockMetas []uploadBlockMeta
 }
 
-func (d *XiaomiCloud) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) error {
+func (d *XiaomiCloud) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) (model.Obj, error) {
 	cache, manifest, uploadProgress, err := prepareUpload(stream, up)
 	if err != nil {
-		return fmt.Errorf("准备上传文件失败: %w", err)
+		return nil, fmt.Errorf("准备上传文件失败: %w", err)
 	}
 
 	createResp, err := d.createUpload(ctx, dstDir, stream, manifest)
 	if err != nil {
-		return normalizeError(err)
+		return nil, normalizeError(err)
 	}
+	fileID := createResp.Data.ID
 	if createResp.Data.Exists {
 		log.Infof("[xiaomi_cloud] 文件秒传成功: %s (ID: %s)", stream.GetName(), createResp.Data.ID)
-		up(100)
-		return nil
+	} else {
+		session, sessionErr := newUploadSession(createResp, len(manifest.blocks))
+		if sessionErr != nil {
+			return nil, sessionErr
+		}
+		log.Infof("[xiaomi_cloud] 开始并发分块上传: %s (%d 块, %d 线程)",
+			stream.GetName(), len(manifest.blocks), min(len(manifest.blocks), normalizeUploadThreads(d.UploadThread)))
+
+		commitMetas, uploadErr := d.uploadBlocks(ctx, cache, manifest, session, uploadProgress)
+		if uploadErr != nil {
+			return nil, uploadErr
+		}
+		fileID, err = d.commitUpload(ctx, dstDir.GetID(), session, commitMetas)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	session, err := newUploadSession(createResp, len(manifest.blocks))
+	uploaded, err := d.waitForUploadedFile(ctx, fileID, dstDir.GetID(), stream.GetName(), manifest)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	log.Infof("[xiaomi_cloud] 开始并发分块上传: %s (%d 块, %d 线程)",
-		stream.GetName(), len(manifest.blocks), min(len(manifest.blocks), normalizeUploadThreads(d.UploadThread)))
-
-	commitMetas, err := d.uploadBlocks(ctx, cache, manifest, session, uploadProgress)
-	if err != nil {
-		return err
-	}
-	if err = d.commitUpload(ctx, dstDir.GetID(), session, commitMetas); err != nil {
-		return err
-	}
-
-	log.Infof("[xiaomi_cloud] 文件上传成功: %s", stream.GetName())
+	d.rememberRecentFile(dstDir.GetID(), uploaded)
+	log.Infof("[xiaomi_cloud] 文件上传成功: %s (ID: %s)", stream.GetName(), uploaded.ID)
 	up(100)
-	return nil
+	return fileToObj(uploaded), nil
+}
+
+func (d *XiaomiCloud) waitForUploadedFile(
+	ctx context.Context,
+	fileID, parentID, name string,
+	manifest uploadManifest,
+) (file, error) {
+	if fileID == "" {
+		return file{}, fmt.Errorf("上传响应缺少文件ID")
+	}
+	var lastErr error
+	for _, delay := range uploadVisibilityDelays {
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return file{}, ctx.Err()
+			case <-timer.C:
+			}
+		}
+
+		uploaded, err := d.getFile(ctx, fileID)
+		if err == nil {
+			if err = validateUploadedFile(uploaded, fileID, parentID, name, manifest.fileSize, manifest.fileSHA1); err == nil {
+				return uploaded, nil
+			}
+			lastErr = err
+			continue
+		}
+		normalized := normalizeError(err)
+		if !errs.IsObjectNotFound(normalized) && !isRetriableError(err) {
+			return file{}, normalized
+		}
+		lastErr = normalized
+	}
+	return file{}, fmt.Errorf("上传已提交但文件元数据仍不可读: id=%s: %v", fileID, lastErr)
 }
 
 func prepareUpload(stream model.FileStreamer, up driver.UpdateProgress) (model.File, uploadManifest, driver.UpdateProgress, error) {
@@ -259,14 +312,16 @@ func uploadBlock(ctx context.Context, cache model.File, offset, size int64, uplo
 	return &resp, nil
 }
 
-func (d *XiaomiCloud) commitUpload(ctx context.Context, parentID string, session uploadSession, commitMetas []commitMeta) error {
+func (d *XiaomiCloud) commitUpload(ctx context.Context, parentID string, session uploadSession, commitMetas []commitMeta) (string, error) {
 	commitData, err := json.Marshal(commitMetas)
 	if err != nil {
-		return fmt.Errorf("序列化分块提交信息失败: %w", err)
+		return "", fmt.Errorf("序列化分块提交信息失败: %w", err)
 	}
 
 	commitURL := fmt.Sprintf("%s%s/files/commit", baseURL, apiPrefix)
+	var resp createUploadResponse
 	err = retryRequest(ctx, uploadAttempts, func() error {
+		resp = createUploadResponse{}
 		return d.request(ctx, commitURL, http.MethodPost, func(req *resty.Request, serviceToken string) {
 			req.SetFormData(map[string]string{
 				"uploadId":                session.uploadID,
@@ -277,12 +332,15 @@ func (d *XiaomiCloud) commitUpload(ctx context.Context, parentID string, session
 				"isClientUploadThumbnail": "false",
 				"serviceToken":            serviceToken,
 			})
-		}, nil)
+		}, &resp)
 	})
 	if err != nil {
-		return fmt.Errorf("提交上传失败: %w", err)
+		return "", fmt.Errorf("提交上传失败: %w", err)
 	}
-	return nil
+	if resp.Data.ID == "" {
+		return "", fmt.Errorf("提交上传响应缺少文件ID")
+	}
+	return resp.Data.ID, nil
 }
 
 func normalizeUploadThreads(threadCount int) int {

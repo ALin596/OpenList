@@ -1,20 +1,46 @@
 package xiaomi_cloud
 
 import (
+	"bytes"
+	"encoding/json"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
 
+type flexibleID string
+
+func (id *flexibleID) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(data, []byte("null")) {
+		*id = ""
+		return nil
+	}
+	if len(data) > 0 && data[0] == '"' {
+		var value string
+		if err := json.Unmarshal(data, &value); err != nil {
+			return err
+		}
+		*id = flexibleID(value)
+		return nil
+	}
+	*id = flexibleID(data)
+	return nil
+}
+
 type file struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	Type       string `json:"type"`
-	Size       int64  `json:"size"`
-	CreateTime int64  `json:"createTime"`
-	ModifyTime int64  `json:"modifyTime"`
-	SHA1       string `json:"sha1"`
+	ID         string     `json:"id"`
+	ParentID   flexibleID `json:"parentId"`
+	Name       string     `json:"name"`
+	Type       string     `json:"type"`
+	Size       int64      `json:"size"`
+	CreateTime int64      `json:"createTime"`
+	ModifyTime int64      `json:"modifyTime"`
+	SHA1       string     `json:"sha1"`
+	Storage    struct {
+		DownloadURL string `json:"downloadUrl"`
+		ExpireAt    int64  `json:"expireAt"`
+	} `json:"storage"`
 }
 
 func fileToObj(f file) model.Obj {
@@ -37,12 +63,7 @@ type listResponse struct {
 }
 
 type fileInfoResponse struct {
-	Data struct {
-		Storage struct {
-			DownloadURL string `json:"downloadUrl"`
-			ExpireAt    int64  `json:"expireAt"`
-		} `json:"storage"`
-	} `json:"data"`
+	Data file `json:"data"`
 }
 
 type storageInfoResponse struct {

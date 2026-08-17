@@ -255,3 +255,47 @@ func TestFileManagerRecordJSONShape(t *testing.T) {
 		t.Fatalf("delete record JSON = %s", deleteRecord)
 	}
 }
+
+func TestMakeDirReturnsCreatedObjectAndBridgesVisibility(t *testing.T) {
+	previousClient := base.RestyClient
+	base.RestyClient = resty.New().SetRetryCount(0).SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case apiPrefix + "/folders/create":
+			form, err := readRequestForm(req)
+			if err != nil {
+				return nil, err
+			}
+			if form.Get("name") != "created" || form.Get("parentId") != "parent-1" || form.Get("serviceToken") != "service" {
+				return nil, errors.New("unexpected create-folder form")
+			}
+			return testResponse(req, http.StatusOK, `{
+				"result":"ok","code":0,"data":{"id":"folder-1"}
+			}`, nil), nil
+		case apiPrefix + "/folders/children":
+			return testResponse(req, http.StatusOK, `{
+				"result":"ok","code":0,"data":{"records":[],"hasMore":false}
+			}`, nil), nil
+		default:
+			return nil, errors.New("unexpected request")
+		}
+	}))
+	t.Cleanup(func() {
+		base.RestyClient = previousClient
+	})
+
+	driver := &XiaomiCloud{}
+	setTestSession(driver, sessionCookies{serviceToken: "service", userID: "user", sessionHash: "session", userHash: "hash"})
+	parent := &model.Object{ID: "parent-1", IsFolder: true}
+	created, err := driver.MakeDir(context.Background(), parent, "created")
+	if err != nil {
+		t.Fatalf("MakeDir() error = %v", err)
+	}
+	if created.GetID() != "folder-1" || created.GetName() != "created" || !created.IsDir() {
+		t.Fatalf("MakeDir() object = id:%q name:%q dir:%v", created.GetID(), created.GetName(), created.IsDir())
+	}
+
+	files, err := driver.List(context.Background(), parent, model.ListArgs{})
+	if err != nil || len(files) != 1 || files[0].GetID() != "folder-1" {
+		t.Fatalf("List() after MakeDir = %+v, %v", files, err)
+	}
+}

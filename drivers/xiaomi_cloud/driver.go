@@ -120,7 +120,7 @@ func (d *XiaomiCloud) Link(ctx context.Context, file model.Obj, _ model.LinkArgs
 	}, nil
 }
 
-func (d *XiaomiCloud) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {
+func (d *XiaomiCloud) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) (model.Obj, error) {
 	apiURL := fmt.Sprintf("%s%s/folders/create", baseURL, apiPrefix)
 
 	var resp createFolderResponse
@@ -133,11 +133,24 @@ func (d *XiaomiCloud) MakeDir(ctx context.Context, parentDir model.Obj, dirName 
 	}, &resp)
 
 	if err != nil {
-		return normalizeError(err)
+		return nil, normalizeError(err)
+	}
+	if resp.Data.ID == "" {
+		return nil, fmt.Errorf("创建文件夹响应缺少目录ID")
+	}
+	if resp.Data.Name == "" {
+		resp.Data.Name = dirName
+	}
+	if resp.Data.ParentID == "" {
+		resp.Data.ParentID = flexibleID(parentDir.GetID())
+	}
+	if resp.Data.Type == "" {
+		resp.Data.Type = "folder"
 	}
 
+	d.rememberRecentFile(parentDir.GetID(), resp.Data)
 	log.Infof("[xiaomi_cloud] 创建文件夹成功: %s (ID: %s)", dirName, resp.Data.ID)
-	return nil
+	return fileToObj(resp.Data), nil
 }
 
 func (d *XiaomiCloud) Move(ctx context.Context, srcObj, dstDir model.Obj) error {
@@ -263,6 +276,7 @@ func (d *XiaomiCloud) GetDetails(ctx context.Context) (*model.StorageDetails, er
 }
 
 var _ driver.Driver = (*XiaomiCloud)(nil)
+var _ driver.MkdirResult = (*XiaomiCloud)(nil)
 var _ driver.PutResult = (*XiaomiCloud)(nil)
 
 func getFileManagerRecordType(obj model.Obj) string {

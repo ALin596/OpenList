@@ -2,6 +2,7 @@ package xiaomi_cloud
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -50,14 +51,28 @@ func installAuthFlow(t *testing.T, serviceLoginCount *atomic.Int32) {
 			case req.URL.Hostname() == "i.mi.com" && req.URL.Path == "/api/user/login":
 				return testResponse(req, http.StatusOK, `{"code":0,"data":{"loginUrl":"https://account.xiaomi.com/pass/serviceLogin?sid=i.mi.com"}}`, nil), nil
 			case req.URL.Hostname() == "account.xiaomi.com" && req.URL.Path == "/pass/serviceLogin":
-				serviceLoginCount.Add(1)
+				count := serviceLoginCount.Add(1)
+				expectedToken := "account-pass"
+				if count > 1 {
+					expectedToken = "renewed-pass"
+					device, err := req.Cookie("deviceId")
+					if err != nil || device.Value != "runtime-device" {
+						return nil, fmt.Errorf("后续续签未携带服务端补发的设备 Cookie")
+					}
+				}
 				cookie, err := req.Cookie("passToken")
-				if err != nil || cookie.Value != "account-pass" {
-					return nil, fmt.Errorf("serviceLogin missing account passToken")
+				if err != nil || cookie.Value != expectedToken {
+					return nil, fmt.Errorf("账号登录未携带当前有效的 passToken")
+				}
+				user, err := req.Cookie("userId")
+				if err != nil || user.Value != "123456" {
+					return nil, fmt.Errorf("账号登录未携带 userId")
 				}
 				header := make(http.Header)
 				header.Set("Location", "https://i.mi.com/sts?ticket=test")
 				header.Add("Set-Cookie", "passToken=renewed-pass; Domain=.account.xiaomi.com; Path=/; Secure; HttpOnly")
+				header.Add("Set-Cookie", "deviceId=runtime-device; Domain=.account.xiaomi.com; Path=/; Secure")
+				header.Add("Set-Cookie", "cUserId=runtime-user; Domain=.account.xiaomi.com; Path=/; Secure")
 				return testResponse(req, http.StatusFound, "", header), nil
 			case req.URL.Hostname() == "i.mi.com" && req.URL.Path == "/sts":
 				header := make(http.Header)
@@ -83,7 +98,8 @@ func TestEnsureServiceTokenFromAccountCookie(t *testing.T) {
 	var serviceLoginCount atomic.Int32
 	installAuthFlow(t, &serviceLoginCount)
 
-	driver := &XiaomiCloud{Addition: Addition{AccountCookie: "passToken=account-pass; userId=123456"}}
+	originalCookie := "userId=123456;  passToken=account-pass"
+	driver := &XiaomiCloud{Addition: Addition{AccountCookie: originalCookie}}
 	if err := driver.ensureServiceToken(context.Background(), ""); err != nil {
 		t.Fatalf("ensureServiceToken() error = %v", err)
 	}
@@ -92,11 +108,29 @@ func TestEnsureServiceTokenFromAccountCookie(t *testing.T) {
 	if session.serviceToken != "new-service" || session.userID != "123456" || session.sessionHash != "new-session-hash" || session.userHash != "new-user-hash" {
 		t.Fatalf("unexpected refreshed session: %+v", session)
 	}
-	if !hasCookie(driver.AccountCookie, "passToken") || !strings.Contains(driver.AccountCookie, "renewed-pass") {
-		t.Fatalf("account cookie was not refreshed: %s", driver.AccountCookie)
+	if driver.AccountCookie != originalCookie {
+		t.Fatal("首次登录改写了用户填写的账号 Cookie")
 	}
 	if serviceLoginCount.Load() != 1 {
 		t.Fatalf("serviceLogin count = %d, want 1", serviceLoginCount.Load())
+	}
+
+	if err := driver.ensureServiceToken(context.Background(), session.serviceToken); err != nil {
+		t.Fatalf("使用内存中的轮换凭据续签失败: %v", err)
+	}
+	if serviceLoginCount.Load() != 2 {
+		t.Fatalf("登录请求次数 = %d，期望 2", serviceLoginCount.Load())
+	}
+	additionJSON, err := json.Marshal(driver.GetAddition())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var savedAddition Addition
+	if err = json.Unmarshal(additionJSON, &savedAddition); err != nil {
+		t.Fatal(err)
+	}
+	if savedAddition.AccountCookie != originalCookie {
+		t.Fatal("续签后的可持久化配置未保留原始账号 Cookie")
 	}
 }
 
@@ -105,11 +139,15 @@ func TestDropClearsSessionAndForcesRefresh(t *testing.T) {
 	installAuthFlow(t, &serviceLoginCount)
 
 	driver := &XiaomiCloud{Addition: Addition{AccountCookie: "passToken=account-pass; userId=123456"}}
+	driver.runtimeAccountCookie = "passToken=obsolete-pass; userId=123456"
 	setTestSession(driver, sessionCookies{serviceToken: "old-service", userID: "123456", sessionHash: "old-session", userHash: "old-user"})
 	driver.rememberRecentFile("0", file{ID: "old-file", ParentID: flexibleID("0"), Name: "old.bin", Type: "other"})
 
 	if err := driver.Drop(context.Background()); err != nil {
 		t.Fatalf("Drop() error = %v", err)
+	}
+	if driver.runtimeAccountCookie != "" {
+		t.Fatal("停用驱动后仍保留旧账号的运行时 Cookie")
 	}
 
 	header := make(http.Header)

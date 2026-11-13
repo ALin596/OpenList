@@ -14,7 +14,6 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
-	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/go-resty/resty/v2"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/publicsuffix"
@@ -72,7 +71,12 @@ func (d *XiaomiCloud) refreshServiceToken(ctx context.Context) error {
 
 	accountURL, _ := url.Parse(accountBaseURL + "/pass/serviceLogin")
 	cloudURL, _ := url.Parse(baseURL + "/")
-	accountCookies := parseCookieHeader(d.AccountCookie)
+	// 服务端轮换的账号凭据只供本次运行续签使用，配置始终保留用户填写的内容。
+	accountCookie := d.runtimeAccountCookie
+	if accountCookie == "" {
+		accountCookie = d.AccountCookie
+	}
+	accountCookies := parseCookieHeader(accountCookie)
 	if !containsCookie(accountCookies, "passToken") {
 		return fmt.Errorf("account_cookie 中缺少 passToken")
 	}
@@ -150,19 +154,12 @@ func (d *XiaomiCloud) refreshServiceToken(ctx context.Context) error {
 	if !newSession.complete() {
 		return fmt.Errorf("账号登录未签发完整的云盘会话")
 	}
-	newAccountCookie := cookieHeader(jar.Cookies(accountURL))
+	d.runtimeAccountCookie = cookieHeader(jar.Cookies(accountURL))
 	d.sessionMu.Lock()
-	accountCookieChanged := newAccountCookie != "" && newAccountCookie != d.AccountCookie
-	if newAccountCookie != "" {
-		d.AccountCookie = newAccountCookie
-	}
 	d.session = newSession
 	d.sessionMu.Unlock()
 
-	if accountCookieChanged && d.ID != 0 {
-		op.MustSaveDriverStorage(d)
-	}
-	log.Infof("[xiaomi_cloud] serviceToken 已自动续签")
+	log.Infof("[xiaomi_cloud] serviceToken 已自动续签，账号 Cookie 仅在内存中更新")
 	return nil
 }
 

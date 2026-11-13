@@ -27,6 +27,8 @@ type XiaomiCloud struct {
 	recentFileMu sync.Mutex
 	session      sessionCookies
 	recentFiles  map[string]map[string]recentFile
+	// 由 refreshMu 保护，保存服务端轮换的凭据，不参与存储配置序列化。
+	runtimeAccountCookie string
 }
 
 func (d *XiaomiCloud) Config() driver.Config {
@@ -78,6 +80,8 @@ func (d *XiaomiCloud) Drop(_ context.Context) error {
 	d.refreshMu.Lock()
 	defer d.refreshMu.Unlock()
 
+	// 重新配置或停用后丢弃旧账号凭据，下次初始化使用用户当前保存的配置。
+	d.runtimeAccountCookie = ""
 	d.sessionMu.Lock()
 	d.session = sessionCookies{}
 	d.sessionMu.Unlock()

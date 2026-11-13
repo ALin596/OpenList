@@ -24,6 +24,7 @@ var config = driver.Config{
 	DefaultRoot:       "0",
 	CheckStatus:       false,
 	NoOverwriteUpload: true,
+	NoLinkURL:         true,
 	Alert: `info|小米云盘存储驱动
 
 配置方式：
@@ -39,6 +40,7 @@ var config = driver.Config{
 - 支持基于SHA1的秒传
 - 支持大文件4MB分块并发上传
 - 支持CDN加速下载
+- 支持通过POST下载大文件
 - 支持完整的文件管理操作`,
 }
 

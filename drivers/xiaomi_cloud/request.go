@@ -50,40 +50,10 @@ func (e *apiError) Error() string {
 }
 
 func (d *XiaomiCloud) request(ctx context.Context, rawURL, method string, callback requestCallback, resp any) error {
-	// 首次启动没有云盘会话才登录，正常请求直接复用当前 serviceToken。
-	if isXiaomiAPIURL(rawURL) && d.sessionSnapshot().serviceToken == "" {
-		if err := d.ensureServiceToken(ctx, ""); err != nil {
-			return err
-		}
-	}
-
-	res, usedSession, err := d.doRequest(ctx, rawURL, method, callback)
+	body, err := d.requestBody(ctx, rawURL, method, callback, true)
 	if err != nil {
 		return err
 	}
-	// 云盘返回 HTTP 401 后续签并重建原请求，只重试一次以免无效凭据造成循环登录。
-	if res.StatusCode() == http.StatusUnauthorized && isXiaomiAPIURL(rawURL) {
-		log.Debugf("[xiaomi_cloud] 云盘会话失效，开始续签: storage_id=%d", d.ID)
-		if err = d.ensureServiceToken(ctx, usedSession.serviceToken); err != nil {
-			return err
-		}
-		res, usedSession, err = d.doRequest(ctx, rawURL, method, callback)
-		if err != nil {
-			return err
-		}
-	}
-
-	if res.StatusCode() != http.StatusOK {
-		if res.StatusCode() == http.StatusUnauthorized {
-			return errs.NewErr(errs.EmptyToken, "账号凭据无法续签有效的 serviceToken")
-		}
-		return &httpStatusError{code: res.StatusCode(), status: res.Status()}
-	}
-
-	if isXiaomiAPIURL(rawURL) {
-		d.updateSessionFromResponse(res, usedSession.serviceToken)
-	}
-	body := res.Body()
 	var errResp errorResponse
 	if err = json.Unmarshal(body, &errResp); err != nil {
 		return fmt.Errorf("解析响应失败: %w", err)
@@ -100,12 +70,73 @@ func (d *XiaomiCloud) request(ctx context.Context, rawURL, method string, callba
 			return fmt.Errorf("解析响应失败: %w", err)
 		}
 	}
-
-	log.Debugf("[xiaomi_cloud] 请求成功: %s %s", method, rawURL)
 	return nil
 }
 
-func (d *XiaomiCloud) doRequest(ctx context.Context, rawURL, method string, callback requestCallback) (*resty.Response, sessionCookies, error) {
+func (d *XiaomiCloud) requestBody(ctx context.Context, rawURL, method string, callback requestCallback, includeTimestamp bool) ([]byte, error) {
+	// 首次启动没有云盘会话才登录，正常请求直接复用当前 serviceToken。
+	if isXiaomiAPIURL(rawURL) && d.sessionSnapshot().serviceToken == "" {
+		if err := d.ensureServiceToken(ctx, ""); err != nil {
+			return nil, err
+		}
+	}
+
+	res, usedSession, err := d.doRequest(ctx, rawURL, method, callback, includeTimestamp)
+	if err != nil {
+		return nil, err
+	}
+	// 云盘返回 HTTP 401 后续签并重建原请求，只重试一次以免无效凭据造成循环登录。
+	if res.StatusCode() == http.StatusUnauthorized && isXiaomiAPIURL(rawURL) {
+		log.Debugf("[xiaomi_cloud] 云盘会话失效，开始续签: storage_id=%d", d.ID)
+		if err = d.ensureServiceToken(ctx, usedSession.serviceToken); err != nil {
+			return nil, err
+		}
+		res, usedSession, err = d.doRequest(ctx, rawURL, method, callback, includeTimestamp)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if res.StatusCode() != http.StatusOK {
+		if res.StatusCode() == http.StatusUnauthorized {
+			return nil, errs.NewErr(errs.EmptyToken, "账号凭据无法续签有效的 serviceToken")
+		}
+		return nil, &httpStatusError{code: res.StatusCode(), status: res.Status()}
+	}
+
+	if isXiaomiAPIURL(rawURL) {
+		d.updateSessionFromResponse(res, usedSession.serviceToken)
+	}
+	parsedURL, _ := url.Parse(rawURL)
+	log.Debugf("[xiaomi_cloud] 请求成功: %s %s%s", method, parsedURL.Host, parsedURL.EscapedPath())
+	return res.Body(), nil
+}
+
+func decodeJSONP(callback string, body []byte, target any) error {
+	response := strings.TrimSpace(string(body))
+	if !strings.HasPrefix(response, callback+"(") {
+		return fmt.Errorf("小米下载 JSONP 回调不匹配")
+	}
+	response = strings.TrimSuffix(response, ";")
+	payload, ok := strings.CutSuffix(strings.TrimPrefix(response, callback+"("), ")")
+	if !ok {
+		return fmt.Errorf("小米下载 JSONP 响应格式无效")
+	}
+	if err := json.Unmarshal([]byte(payload), target); err != nil {
+		return fmt.Errorf("解析小米下载 JSONP 响应失败: %w", err)
+	}
+	return nil
+}
+
+func safeErrorForLog(err error) string {
+	var requestErr *url.Error
+	if errors.As(err, &requestErr) {
+		return requestErr.Err.Error()
+	}
+	return err.Error()
+}
+
+func (d *XiaomiCloud) doRequest(ctx context.Context, rawURL, method string, callback requestCallback, includeTimestamp bool) (*resty.Response, sessionCookies, error) {
 	req := base.RestyClient.R().SetContext(ctx)
 	session := d.sessionSnapshot()
 	req.SetHeaders(map[string]string{
@@ -122,7 +153,9 @@ func (d *XiaomiCloud) doRequest(ctx context.Context, rawURL, method string, call
 		)
 		req.SetCookies(cookies)
 	}
-	req.SetQueryParam("ts", fmt.Sprint(time.Now().UnixMilli()))
+	if includeTimestamp {
+		req.SetQueryParam("ts", fmt.Sprint(time.Now().UnixMilli()))
+	}
 	if callback != nil {
 		callback(req, session.serviceToken)
 	}

@@ -2,6 +2,7 @@ package xiaomi_cloud
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/go-resty/resty/v2"
+	log "github.com/sirupsen/logrus"
 )
 
 const recentFileTTL = time.Minute
@@ -50,6 +52,54 @@ func (d *XiaomiCloud) getFile(ctx context.Context, fileID string) (file, error) 
 		return file{}, err
 	}
 	return resp.Data, nil
+}
+
+func (d *XiaomiCloud) getDownloadInfo(ctx context.Context, fileID string) (download xiaomiDownload, err error) {
+	// JSONP 地址携带临时签名；失败日志保留文件标识和原因，不记录请求查询参数。
+	defer func() {
+		if err != nil {
+			log.Errorf("[xiaomi_cloud] 获取下载信息失败: file_id=%s, error=%s", fileID, safeErrorForLog(err))
+		}
+	}()
+
+	ids, err := json.Marshal([]string{fileID})
+	if err != nil {
+		return xiaomiDownload{}, fmt.Errorf("构建小米下载请求失败: %w", err)
+	}
+	callback := fmt.Sprintf("dlFileJsonpCb_%d_0", time.Now().UnixNano())
+	apiURL := fmt.Sprintf("%s%s/files/download", baseURL, apiPrefix)
+	var response downloadURLResponse
+	err = d.request(ctx, apiURL, http.MethodGet, func(req *resty.Request, _ string) {
+		req.SetQueryParams(map[string]string{
+			"ids":           string(ids),
+			"jsonpCallback": callback,
+		})
+	}, &response)
+	if err != nil {
+		return xiaomiDownload{}, err
+	}
+	if len(response.Data.Downloads) == 0 {
+		return xiaomiDownload{}, fmt.Errorf("小米云盘未返回文件下载信息: file_id=%s", fileID)
+	}
+
+	jsonpURL := response.Data.Downloads[0].JSONPURL
+	if jsonpURL == "" {
+		return xiaomiDownload{}, fmt.Errorf("小米云盘下载信息缺少 JSONP 地址: file_id=%s", fileID)
+	}
+	body, err := d.requestBody(ctx, jsonpURL, http.MethodGet, func(req *resty.Request, _ string) {
+		req.SetQueryParam("callback", callback)
+	}, false)
+	if err != nil {
+		return xiaomiDownload{}, err
+	}
+	if err = decodeJSONP(callback, body, &download); err != nil {
+		return xiaomiDownload{}, err
+	}
+	if download.URL == "" || download.Meta == "" {
+		return xiaomiDownload{}, fmt.Errorf("小米云盘下载 JSONP 响应缺少地址或 meta: file_id=%s", fileID)
+	}
+	download.ExpireAt = response.Data.Downloads[0].ExpireAt
+	return download, nil
 }
 
 func (d *XiaomiCloud) rememberRecentFile(parentID string, uploaded file) {

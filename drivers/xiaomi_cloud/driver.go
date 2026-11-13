@@ -5,14 +5,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	xiaominet "github.com/OpenListTeam/OpenList/v4/internal/net"
+	"github.com/OpenListTeam/OpenList/v4/internal/stream"
+	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/go-resty/resty/v2"
 	log "github.com/sirupsen/logrus"
@@ -95,22 +100,21 @@ func (d *XiaomiCloud) List(ctx context.Context, dir model.Obj, _ model.ListArgs)
 }
 
 func (d *XiaomiCloud) Link(ctx context.Context, file model.Obj, _ model.LinkArgs) (*model.Link, error) {
-	fileInfo, err := d.getFile(ctx, file.GetID())
+	download, err := d.getDownloadInfo(ctx, file.GetID())
 	if err != nil {
 		return nil, normalizeError(err)
 	}
 
-	// 检查URL是否过期
-	if fileInfo.Storage.ExpireAt < time.Now().UnixMilli() {
+	// 下载地址和表单 meta 有效期相同，缓存不得超过小米返回的失效时间。
+	expiration := time.Until(time.UnixMilli(download.ExpireAt))
+	if expiration <= 0 {
 		return nil, fmt.Errorf("下载链接已过期,请重试")
 	}
 
 	return &model.Link{
-		URL: fileInfo.Storage.DownloadURL,
-		Header: http.Header{
-			"Referer":    []string{referer},
-			"User-Agent": []string{userAgent},
-		},
+		RangeReader:   stream.RateLimitRangeReaderFunc(downloadRangeReader(file.GetID(), download, file.GetSize())),
+		ContentLength: file.GetSize(),
+		Expiration:    &expiration,
 	}, nil
 }
 
@@ -272,6 +276,59 @@ func (d *XiaomiCloud) GetDetails(ctx context.Context) (*model.StorageDetails, er
 var _ driver.Driver = (*XiaomiCloud)(nil)
 var _ driver.MkdirResult = (*XiaomiCloud)(nil)
 var _ driver.PutResult = (*XiaomiCloud)(nil)
+
+func downloadRangeReader(fileID string, download xiaomiDownload, size int64) stream.RangeReaderFunc {
+	return func(ctx context.Context, requested http_range.Range) (io.ReadCloser, error) {
+		if requested.Length < 0 || requested.Start+requested.Length > size {
+			requested.Length = size - requested.Start
+		}
+
+		req := base.RestyClient.R().
+			SetContext(ctx).
+			SetHeaders(map[string]string{
+				"Referer":    referer,
+				"User-Agent": userAgent,
+			}).
+			SetFormData(map[string]string{"meta": download.Meta}).
+			SetDoNotParseResponse(true)
+		if requested.Length > 0 {
+			headers := http_range.ApplyRangeToHttpHeader(requested, make(http.Header))
+			req.SetHeader("Range", headers.Get("Range"))
+		}
+
+		// 小米网页把大块下载 meta 放在 POST 表单体中，避免它进入受长度限制的 URL。
+		response, err := req.Post(download.URL)
+		if err != nil {
+			log.Errorf("[xiaomi_cloud] POST 下载失败: file_id=%s, range_start=%d, error=%s", fileID, requested.Start, safeErrorForLog(err))
+			return nil, fmt.Errorf("提交小米下载表单失败: %w", err)
+		}
+		body := response.RawBody()
+		if response.StatusCode() == http.StatusPartialContent {
+			if got, want := response.RawResponse.Header.Get("Content-Range"), requested.ContentRange(size); got != want {
+				body.Close()
+				err := fmt.Errorf("小米云盘范围下载响应不匹配: got %q, want %q", got, want)
+				log.Errorf("[xiaomi_cloud] POST 下载范围异常: file_id=%s, range_start=%d, error=%s", fileID, requested.Start, err)
+				return nil, err
+			}
+			return body, nil
+		}
+		if response.StatusCode() != http.StatusOK {
+			body.Close()
+			err := &httpStatusError{code: response.StatusCode(), status: response.Status()}
+			log.Errorf("[xiaomi_cloud] POST 下载被拒绝: file_id=%s, range_start=%d, error=%v", fileID, requested.Start, err)
+			return nil, err
+		}
+
+		// 部分小米下载节点忽略 Range；保留同一份流式 POST 响应并从请求偏移读取。
+		rangedBody, err := xiaominet.GetRangedHttpReader(body, requested.Start, requested.Length)
+		if err != nil {
+			body.Close()
+			log.Errorf("[xiaomi_cloud] 读取 POST 下载范围失败: file_id=%s, range_start=%d, error=%s", fileID, requested.Start, safeErrorForLog(err))
+			return nil, err
+		}
+		return rangedBody, nil
+	}
+}
 
 func getFileManagerRecordType(obj model.Obj) string {
 	if obj.IsDir() {

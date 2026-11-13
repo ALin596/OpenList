@@ -66,6 +66,21 @@ type fileInfoResponse struct {
 	Data file `json:"data"`
 }
 
+type downloadURLResponse struct {
+	Data struct {
+		Downloads []struct {
+			JSONPURL string `json:"jsonpUrl"`
+			ExpireAt int64  `json:"expireAt"`
+		} `json:"downLoads"`
+	} `json:"data"`
+}
+
+type xiaomiDownload struct {
+	URL      string `json:"url"`
+	Meta     string `json:"meta"`
+	ExpireAt int64
+}
+
 type storageInfoResponse struct {
 	Data struct {
 		TotalQuota int64 `json:"totalQuota"`

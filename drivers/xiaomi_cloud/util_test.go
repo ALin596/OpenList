@@ -3,31 +3,20 @@ package xiaomi_cloud
 import (
 	"context"
 	"net/http"
-	"strings"
 	"testing"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/go-resty/resty/v2"
 )
 
-func TestCookieHeaderHelpers(t *testing.T) {
-	cookies := parseCookieHeader("passToken=token+/=; userId=123456; malformed")
-	if !containsCookie(cookies, "passToken") || !containsCookie(cookies, "userId") {
-		t.Fatalf("failed to parse account cookies: %+v", cookies)
-	}
-	if containsCookie(cookies, "malformed") {
-		t.Fatal("malformed cookie was unexpectedly accepted")
-	}
-
-	header := cookieHeader(cookies)
-	if !strings.Contains(header, "passToken=token+/=") || !strings.Contains(header, "userId=123456") {
-		t.Fatalf("unexpected serialized cookie header: %s", header)
-	}
-}
-
 func TestSessionCookiesApplyIgnoresDeletion(t *testing.T) {
 	session := sessionCookies{serviceToken: "old-service"}
-	session.apply(parseCookieHeader("serviceToken=; userId=123456; i.mi.com_slh=session; i.mi.com_ph=user"))
+	session.apply([]*http.Cookie{
+		{Name: "serviceToken", Value: ""},
+		{Name: "userId", Value: "123456"},
+		{Name: "i.mi.com_slh", Value: "session"},
+		{Name: "i.mi.com_ph", Value: "user"},
+	})
 	if session.serviceToken != "old-service" {
 		t.Fatalf("serviceToken deletion replaced in-memory token: %q", session.serviceToken)
 	}

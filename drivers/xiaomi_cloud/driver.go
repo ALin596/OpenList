@@ -27,8 +27,6 @@ type XiaomiCloud struct {
 	recentFileMu sync.Mutex
 	session      sessionCookies
 	recentFiles  map[string]map[string]recentFile
-	// 由 refreshMu 保护，保存服务端轮换的凭据，不参与存储配置序列化。
-	runtimeAccountCookie string
 }
 
 func (d *XiaomiCloud) Config() driver.Config {
@@ -41,17 +39,11 @@ func (d *XiaomiCloud) GetAddition() driver.Additional {
 
 func (d *XiaomiCloud) Init(ctx context.Context) error {
 	d.UploadThread = normalizeUploadThreads(d.UploadThread)
-	if strings.TrimSpace(d.AccountCookie) == "" {
-		return fmt.Errorf("account_cookie 不能为空")
-	}
-	if !hasCookie(d.AccountCookie, "passToken") {
-		return fmt.Errorf("account_cookie 中缺少 passToken")
-	}
 	if err := d.ensureServiceToken(ctx, ""); err != nil {
 		return normalizeError(err)
 	}
 
-	// 验证Cookie有效性
+	// 仅当云盘会话有效且账号状态正常时，存储才进入可用状态。
 	apiURL := fmt.Sprintf("%s/user/status", baseURL)
 	var statusResp struct {
 		Data struct {
@@ -63,7 +55,7 @@ func (d *XiaomiCloud) Init(ctx context.Context) error {
 	if err != nil {
 		var apiErr *apiError
 		if errors.As(err, &apiErr) {
-			return errs.NewErr(errs.EmptyToken, "serviceToken 验证失败，请检查 account_cookie: %v", err)
+			return errs.NewErr(errs.EmptyToken, "serviceToken 验证失败，请检查 passToken 和 userId: %v", err)
 		}
 		return normalizeError(err)
 	}
@@ -80,8 +72,6 @@ func (d *XiaomiCloud) Drop(_ context.Context) error {
 	d.refreshMu.Lock()
 	defer d.refreshMu.Unlock()
 
-	// 重新配置或停用后丢弃旧账号凭据，下次初始化使用用户当前保存的配置。
-	d.runtimeAccountCookie = ""
 	d.sessionMu.Lock()
 	d.session = sessionCookies{}
 	d.sessionMu.Unlock()

@@ -7,13 +7,13 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/go-resty/resty/v2"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/publicsuffix"
@@ -57,8 +57,9 @@ func (d *XiaomiCloud) ensureServiceToken(ctx context.Context, staleToken string)
 	if currentToken != "" && (staleToken == "" || currentToken != staleToken) {
 		return nil
 	}
+	log.Debugf("[xiaomi_cloud] 开始获取云盘会话: storage_id=%d", d.ID)
 	if err := d.refreshServiceToken(ctx); err != nil {
-		return errs.NewErr(errs.EmptyToken, "account_cookie 已失效或需要完成小米账号安全验证: %v", err)
+		return errs.NewErr(errs.EmptyToken, "账号凭据续签云盘会话失败: %v", err)
 	}
 	return nil
 }
@@ -71,14 +72,9 @@ func (d *XiaomiCloud) refreshServiceToken(ctx context.Context) error {
 
 	accountURL, _ := url.Parse(accountBaseURL + "/pass/serviceLogin")
 	cloudURL, _ := url.Parse(baseURL + "/")
-	// 服务端轮换的账号凭据只供本次运行续签使用，配置始终保留用户填写的内容。
-	accountCookie := d.runtimeAccountCookie
-	if accountCookie == "" {
-		accountCookie = d.AccountCookie
-	}
-	accountCookies := parseCookieHeader(accountCookie)
-	if !containsCookie(accountCookies, "passToken") {
-		return fmt.Errorf("account_cookie 中缺少 passToken")
+	accountCookies, err := d.accountCookies()
+	if err != nil {
+		return err
 	}
 	jar.SetCookies(accountURL, accountCookies)
 	jar.SetCookies(cloudURL, d.sessionSnapshot().httpCookies())
@@ -152,28 +148,80 @@ func (d *XiaomiCloud) refreshServiceToken(ctx context.Context) error {
 
 	newSession := sessionCookiesFromHTTP(jar.Cookies(cloudURL))
 	if !newSession.complete() {
-		return fmt.Errorf("账号登录未签发完整的云盘会话")
+		finalURL := serviceResp.RawResponse.Request.URL
+		missing := []string{}
+		for _, cookie := range newSession.allCookies() {
+			if cookie.Value == "" {
+				missing = append(missing, cookie.Name)
+			}
+		}
+		// 日志只记录跳转路径和缺失字段，签名、票据及 Cookie 值不得写入日志。
+		log.Warnf("[xiaomi_cloud] 云盘会话获取失败: storage_id=%d status=%d host=%s path=%s missing=%s",
+			d.ID, serviceResp.StatusCode(), finalURL.Hostname(), finalURL.EscapedPath(), strings.Join(missing, ","))
+		return fmt.Errorf("账号登录未签发完整的云盘会话，缺少 %s；最终页面 %s%s（HTTP %d）",
+			strings.Join(missing, ", "), finalURL.Hostname(), finalURL.EscapedPath(), serviceResp.StatusCode())
 	}
-	d.runtimeAccountCookie = cookieHeader(jar.Cookies(accountURL))
 	d.sessionMu.Lock()
 	d.session = newSession
 	d.sessionMu.Unlock()
+	d.updateAccountCredentials(jar.Cookies(accountURL))
 
-	log.Infof("[xiaomi_cloud] serviceToken 已自动续签，账号 Cookie 仅在内存中更新")
+	log.Infof("[xiaomi_cloud] serviceToken 已自动续签: storage_id=%d", d.ID)
 	return nil
 }
 
-func (s sessionCookies) httpCookies() []*http.Cookie {
-	values := map[string]string{
-		"serviceToken": s.serviceToken,
-		"userId":       s.userID,
-		"i.mi.com_slh": s.sessionHash,
-		"i.mi.com_ph":  s.userHash,
+func (d *XiaomiCloud) accountCookies() ([]*http.Cookie, error) {
+	cookies := []*http.Cookie{
+		{Name: "passToken", Value: d.PassToken},
+		{Name: "userId", Value: d.UserID},
 	}
-	cookies := make([]*http.Cookie, 0, len(values))
-	for _, name := range []string{"serviceToken", "userId", "i.mi.com_slh", "i.mi.com_ph"} {
-		if values[name] != "" {
-			cookies = append(cookies, &http.Cookie{Name: name, Value: values[name]})
+	for _, cookie := range cookies {
+		if strings.TrimSpace(cookie.Value) == "" {
+			return nil, fmt.Errorf("%s 不能为空", cookie.Name)
+		}
+		if err := cookie.Valid(); err != nil {
+			return nil, fmt.Errorf("%s 格式无效，请仅填写 Cookie 的值", cookie.Name)
+		}
+	}
+	return cookies, nil
+}
+
+func (d *XiaomiCloud) updateAccountCredentials(cookies []*http.Cookie) {
+	changed := false
+	for _, cookie := range cookies {
+		if cookie.Value == "" {
+			continue
+		}
+		switch cookie.Name {
+		case "passToken":
+			changed = changed || d.PassToken != cookie.Value
+			d.PassToken = cookie.Value
+		case "userId":
+			changed = changed || d.UserID != cookie.Value
+			d.UserID = cookie.Value
+		}
+	}
+	// 登录成功后保存轮换的账号凭据，重启时直接使用最新值；其余 Cookie 不写入配置。
+	if changed && d.ID != 0 {
+		op.MustSaveDriverStorage(d)
+		log.Infof("[xiaomi_cloud] 账号凭据发生轮换: storage_id=%d", d.ID)
+	}
+}
+
+func (s sessionCookies) allCookies() []*http.Cookie {
+	return []*http.Cookie{
+		{Name: "serviceToken", Value: s.serviceToken},
+		{Name: "userId", Value: s.userID},
+		{Name: "i.mi.com_slh", Value: s.sessionHash},
+		{Name: "i.mi.com_ph", Value: s.userHash},
+	}
+}
+
+func (s sessionCookies) httpCookies() []*http.Cookie {
+	cookies := make([]*http.Cookie, 0, 4)
+	for _, cookie := range s.allCookies() {
+		if cookie.Value != "" {
+			cookies = append(cookies, cookie)
 		}
 	}
 	return cookies
@@ -205,42 +253,4 @@ func sessionCookiesFromHTTP(cookies []*http.Cookie) sessionCookies {
 	var session sessionCookies
 	session.apply(cookies)
 	return session
-}
-
-func parseCookieHeader(cookieString string) []*http.Cookie {
-	req := &http.Request{Header: make(http.Header)}
-	req.Header.Set("Cookie", cookieString)
-	return req.Cookies()
-}
-
-func containsCookie(cookies []*http.Cookie, name string) bool {
-	for _, cookie := range cookies {
-		if cookie.Name == name && cookie.Value != "" {
-			return true
-		}
-	}
-	return false
-}
-
-func hasCookie(cookieString, name string) bool {
-	return containsCookie(parseCookieHeader(cookieString), name)
-}
-
-func cookieHeader(cookies []*http.Cookie) string {
-	values := make(map[string]string, len(cookies))
-	for _, cookie := range cookies {
-		if cookie.Name != "" && cookie.Value != "" {
-			values[cookie.Name] = cookie.Value
-		}
-	}
-	names := make([]string, 0, len(values))
-	for name := range values {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	pairs := make([]string, 0, len(names))
-	for _, name := range names {
-		pairs = append(pairs, (&http.Cookie{Name: name, Value: values[name]}).String())
-	}
-	return strings.Join(pairs, "; ")
 }

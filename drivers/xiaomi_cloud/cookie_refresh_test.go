@@ -42,7 +42,7 @@ func setTestSession(driver *XiaomiCloud, session sessionCookies) {
 	driver.sessionMu.Unlock()
 }
 
-func installAuthFlow(t *testing.T, serviceLoginCount *atomic.Int32) {
+func installAuthFlow(t *testing.T, serviceLoginCount *atomic.Int32, initialPassToken string) {
 	t.Helper()
 	previousFactory := newXiaomiAuthClient
 	newXiaomiAuthClient = func() *resty.Client {
@@ -52,13 +52,9 @@ func installAuthFlow(t *testing.T, serviceLoginCount *atomic.Int32) {
 				return testResponse(req, http.StatusOK, `{"code":0,"data":{"loginUrl":"https://account.xiaomi.com/pass/serviceLogin?sid=i.mi.com"}}`, nil), nil
 			case req.URL.Hostname() == "account.xiaomi.com" && req.URL.Path == "/pass/serviceLogin":
 				count := serviceLoginCount.Add(1)
-				expectedToken := "account-pass"
+				expectedToken := initialPassToken
 				if count > 1 {
 					expectedToken = "renewed-pass"
-					device, err := req.Cookie("deviceId")
-					if err != nil || device.Value != "runtime-device" {
-						return nil, fmt.Errorf("后续续签未携带服务端补发的设备 Cookie")
-					}
 				}
 				cookie, err := req.Cookie("passToken")
 				if err != nil || cookie.Value != expectedToken {
@@ -71,8 +67,6 @@ func installAuthFlow(t *testing.T, serviceLoginCount *atomic.Int32) {
 				header := make(http.Header)
 				header.Set("Location", "https://i.mi.com/sts?ticket=test")
 				header.Add("Set-Cookie", "passToken=renewed-pass; Domain=.account.xiaomi.com; Path=/; Secure; HttpOnly")
-				header.Add("Set-Cookie", "deviceId=runtime-device; Domain=.account.xiaomi.com; Path=/; Secure")
-				header.Add("Set-Cookie", "cUserId=runtime-user; Domain=.account.xiaomi.com; Path=/; Secure")
 				return testResponse(req, http.StatusFound, "", header), nil
 			case req.URL.Hostname() == "i.mi.com" && req.URL.Path == "/sts":
 				header := make(http.Header)
@@ -94,12 +88,11 @@ func installAuthFlow(t *testing.T, serviceLoginCount *atomic.Int32) {
 	})
 }
 
-func TestEnsureServiceTokenFromAccountCookie(t *testing.T) {
+func TestEnsureServiceTokenFromAccountCredentials(t *testing.T) {
 	var serviceLoginCount atomic.Int32
-	installAuthFlow(t, &serviceLoginCount)
+	installAuthFlow(t, &serviceLoginCount, "account-pass")
 
-	originalCookie := "userId=123456;  passToken=account-pass"
-	driver := &XiaomiCloud{Addition: Addition{AccountCookie: originalCookie}}
+	driver := &XiaomiCloud{Addition: Addition{PassToken: "account-pass", UserID: "123456"}}
 	if err := driver.ensureServiceToken(context.Background(), ""); err != nil {
 		t.Fatalf("ensureServiceToken() error = %v", err)
 	}
@@ -108,8 +101,8 @@ func TestEnsureServiceTokenFromAccountCookie(t *testing.T) {
 	if session.serviceToken != "new-service" || session.userID != "123456" || session.sessionHash != "new-session-hash" || session.userHash != "new-user-hash" {
 		t.Fatalf("unexpected refreshed session: %+v", session)
 	}
-	if driver.AccountCookie != originalCookie {
-		t.Fatal("首次登录改写了用户填写的账号 Cookie")
+	if driver.PassToken != "renewed-pass" || driver.UserID != "123456" {
+		t.Fatal("首次登录未更新独立账号凭据")
 	}
 	if serviceLoginCount.Load() != 1 {
 		t.Fatalf("serviceLogin count = %d, want 1", serviceLoginCount.Load())
@@ -129,25 +122,21 @@ func TestEnsureServiceTokenFromAccountCookie(t *testing.T) {
 	if err = json.Unmarshal(additionJSON, &savedAddition); err != nil {
 		t.Fatal(err)
 	}
-	if savedAddition.AccountCookie != originalCookie {
-		t.Fatal("续签后的可持久化配置未保留原始账号 Cookie")
+	if savedAddition.PassToken != "renewed-pass" || savedAddition.UserID != "123456" {
+		t.Fatal("续签后的可持久化配置未包含最新账号凭据")
 	}
 }
 
 func TestDropClearsSessionAndForcesRefresh(t *testing.T) {
 	var serviceLoginCount atomic.Int32
-	installAuthFlow(t, &serviceLoginCount)
+	installAuthFlow(t, &serviceLoginCount, "account-pass")
 
-	driver := &XiaomiCloud{Addition: Addition{AccountCookie: "passToken=account-pass; userId=123456"}}
-	driver.runtimeAccountCookie = "passToken=obsolete-pass; userId=123456"
+	driver := &XiaomiCloud{Addition: Addition{PassToken: "account-pass", UserID: "123456"}}
 	setTestSession(driver, sessionCookies{serviceToken: "old-service", userID: "123456", sessionHash: "old-session", userHash: "old-user"})
 	driver.rememberRecentFile("0", file{ID: "old-file", ParentID: flexibleID("0"), Name: "old.bin", Type: "other"})
 
 	if err := driver.Drop(context.Background()); err != nil {
 		t.Fatalf("Drop() error = %v", err)
-	}
-	if driver.runtimeAccountCookie != "" {
-		t.Fatal("停用驱动后仍保留旧账号的运行时 Cookie")
 	}
 
 	header := make(http.Header)
@@ -179,7 +168,7 @@ func TestDropClearsSessionAndForcesRefresh(t *testing.T) {
 
 func TestRequestRefreshesAndRebuildsPostBody(t *testing.T) {
 	var serviceLoginCount atomic.Int32
-	installAuthFlow(t, &serviceLoginCount)
+	installAuthFlow(t, &serviceLoginCount, "account-pass")
 
 	previousClient := base.RestyClient
 	var attemptsMu sync.Mutex
@@ -210,7 +199,7 @@ func TestRequestRefreshesAndRebuildsPostBody(t *testing.T) {
 		base.RestyClient = previousClient
 	})
 
-	driver := &XiaomiCloud{Addition: Addition{AccountCookie: "passToken=account-pass; userId=123456"}}
+	driver := &XiaomiCloud{Addition: Addition{PassToken: "account-pass", UserID: "123456"}}
 	setTestSession(driver, sessionCookies{serviceToken: "old-service", userID: "123456", sessionHash: "old-session", userHash: "old-user"})
 
 	var result struct {
@@ -233,9 +222,53 @@ func TestRequestRefreshesAndRebuildsPostBody(t *testing.T) {
 	}
 }
 
+func TestRequestReusesValidServiceToken(t *testing.T) {
+	var serviceLoginCount atomic.Int32
+	installAuthFlow(t, &serviceLoginCount, "account-pass")
+	previousClient := base.RestyClient
+	base.RestyClient = resty.New().SetRetryCount(0).SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		cookie, err := req.Cookie("serviceToken")
+		if err != nil || cookie.Value != "valid-service" {
+			return nil, fmt.Errorf("未复用有效的云盘会话")
+		}
+		return testResponse(req, http.StatusOK, `{"code":0}`, nil), nil
+	}))
+	t.Cleanup(func() { base.RestyClient = previousClient })
+	driver := &XiaomiCloud{Addition: Addition{PassToken: "account-pass", UserID: "123456"}}
+	setTestSession(driver, sessionCookies{serviceToken: "valid-service", userID: "123456", sessionHash: "session", userHash: "user"})
+	for range 2 {
+		if err := driver.request(context.Background(), baseURL+"/user/status", http.MethodGet, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if serviceLoginCount.Load() != 0 {
+		t.Fatal("云盘会话有效时仍发起了账号登录")
+	}
+}
+
+func TestRequestStopsAfterUnauthorizedRetry(t *testing.T) {
+	var serviceLoginCount atomic.Int32
+	installAuthFlow(t, &serviceLoginCount, "account-pass")
+	previousClient := base.RestyClient
+	var requests atomic.Int32
+	base.RestyClient = resty.New().SetRetryCount(0).SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests.Add(1)
+		return testResponse(req, http.StatusUnauthorized, `{"R":401}`, nil), nil
+	}))
+	t.Cleanup(func() { base.RestyClient = previousClient })
+	driver := &XiaomiCloud{Addition: Addition{PassToken: "account-pass", UserID: "123456"}}
+	setTestSession(driver, sessionCookies{serviceToken: "old-service", userID: "123456", sessionHash: "session", userHash: "user"})
+	if err := driver.request(context.Background(), baseURL+"/user/status", http.MethodGet, nil, nil); err == nil {
+		t.Fatal("续签后仍被拒绝时未返回错误")
+	}
+	if requests.Load() != 2 || serviceLoginCount.Load() != 1 {
+		t.Fatalf("业务请求次数 = %d，账号登录次数 = %d，期望 2 和 1", requests.Load(), serviceLoginCount.Load())
+	}
+}
+
 func TestConcurrentUnauthorizedRequestsShareRefresh(t *testing.T) {
 	var serviceLoginCount atomic.Int32
-	installAuthFlow(t, &serviceLoginCount)
+	installAuthFlow(t, &serviceLoginCount, "account-pass")
 
 	previousClient := base.RestyClient
 	var oldRequests atomic.Int32
@@ -258,7 +291,7 @@ func TestConcurrentUnauthorizedRequestsShareRefresh(t *testing.T) {
 		base.RestyClient = previousClient
 	})
 
-	driver := &XiaomiCloud{Addition: Addition{AccountCookie: "passToken=account-pass; userId=123456"}}
+	driver := &XiaomiCloud{Addition: Addition{PassToken: "account-pass", UserID: "123456"}}
 	setTestSession(driver, sessionCookies{serviceToken: "old-service", userID: "123456", sessionHash: "old-session", userHash: "old-user"})
 
 	errs := make(chan error, 2)

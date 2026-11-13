@@ -50,6 +50,7 @@ func (e *apiError) Error() string {
 }
 
 func (d *XiaomiCloud) request(ctx context.Context, rawURL, method string, callback requestCallback, resp any) error {
+	// 首次启动没有云盘会话才登录，正常请求直接复用当前 serviceToken。
 	if isXiaomiAPIURL(rawURL) && d.sessionSnapshot().serviceToken == "" {
 		if err := d.ensureServiceToken(ctx, ""); err != nil {
 			return err
@@ -60,7 +61,9 @@ func (d *XiaomiCloud) request(ctx context.Context, rawURL, method string, callba
 	if err != nil {
 		return err
 	}
+	// 云盘返回 HTTP 401 后续签并重建原请求，只重试一次以免无效凭据造成循环登录。
 	if res.StatusCode() == http.StatusUnauthorized && isXiaomiAPIURL(rawURL) {
+		log.Debugf("[xiaomi_cloud] 云盘会话失效，开始续签: storage_id=%d", d.ID)
 		if err = d.ensureServiceToken(ctx, usedSession.serviceToken); err != nil {
 			return err
 		}
@@ -72,7 +75,7 @@ func (d *XiaomiCloud) request(ctx context.Context, rawURL, method string, callba
 
 	if res.StatusCode() != http.StatusOK {
 		if res.StatusCode() == http.StatusUnauthorized {
-			return errs.NewErr(errs.EmptyToken, "account_cookie 无法续签有效的 serviceToken")
+			return errs.NewErr(errs.EmptyToken, "账号凭据无法续签有效的 serviceToken")
 		}
 		return &httpStatusError{code: res.StatusCode(), status: res.Status()}
 	}
@@ -195,7 +198,7 @@ func normalizeError(err error) error {
 	}
 	switch statusCode {
 	case http.StatusUnauthorized:
-		return errs.NewErr(errs.EmptyToken, "account_cookie 已失效或需要重新提取")
+		return errs.NewErr(errs.EmptyToken, "账号凭据已失效或需要重新提取 passToken 和 userId")
 	case http.StatusForbidden:
 		return fmt.Errorf("访问被拒绝: %w", err)
 	case http.StatusNotFound:

@@ -1,0 +1,14 @@
+.claude
+.history
+.idea
+.github
+build
+dist
+output
+tests
+OpenList.exe
+*.exe
+*.test
+*.out
+.DS_Store
+public/dist
